@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.test
+*.out
+/bin/
+/agent
+/main
