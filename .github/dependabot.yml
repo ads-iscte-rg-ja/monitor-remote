@@ -1,0 +1,14 @@
+# Copiar para <repo>/.github/dependabot.yml (o GitHub exige-o em cada repositório).
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      go-dependencies:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
