@@ -1,0 +1,22 @@
+# Gerado a partir de monitor-platform/templates/ci.yml.
+# Toda a lógica vive em monitor-platform; aqui só se escolhem as opções do repo.
+# A versão do pipeline é fixada pela tag (@v1) do monitor-platform; para atualizar, mover a tag.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  go:
+    uses: ads-iscte-rg-ja/monitor-platform/.github/workflows/go-ci.yml@v1
+    with:
+      # false durante a medição de baseline (iteração 0); true depois.
+      lint-blocking: false
+    secrets: inherit
