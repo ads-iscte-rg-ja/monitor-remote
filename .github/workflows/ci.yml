@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   go:
-    uses: joaoaeafonso/monitor-platform/.github/workflows/go-ci.yml@v1
+    uses: ads-iscte-rg-ja/monitor-platform/.github/workflows/go-ci.yml@v1
     with:
       # false durante a medição de baseline (iteração 0); true depois.
       lint-blocking: false
