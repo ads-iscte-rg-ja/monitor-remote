@@ -1,5 +1,6 @@
 # Gerado a partir de monitor-platform/templates/ci.yml.
 # Toda a lógica vive em monitor-platform; aqui só se escolhem as opções do repo.
+# A versão do pipeline é fixada pela tag (@v1) do monitor-platform; para atualizar, mover a tag.
 name: ci
 
 on:
