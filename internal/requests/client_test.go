@@ -1,117 +1,21 @@
-package requests
+package requests_test
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"io"
-	"net/http"
 	"strings"
 	"testing"
 	"time"
 
+	ingestv1 "github.com/ads-iscte-rg-ja/monitor-api/gen/go/monitor/ingest/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"monitor-remote/internal/models"
+	"monitor-remote/internal/requests"
+	"monitor-remote/internal/requests/requeststest"
 	"monitor-remote/internal/validation"
 )
-
-type transportFunc func(*http.Request) (*http.Response, error)
-
-func (f transportFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
-
-func TestStatAcknowledgementAndSourceID(t *testing.T) {
-	for _, tc := range []struct {
-		name, body, contentType string
-		status                  int
-		valid                   bool
-	}{
-		{"valid", `{"data":[{"id":9,"host_id":7,"source_id":42}]}`, "application/json", 201, true},
-		{"HTML", "<html>login</html>", "text/html", 201, false},
-		{"empty", "", "application/json", 201, false},
-		{"wrong status", `{"data":[{"id":9,"host_id":7,"source_id":42}]}`, "application/json", 200, false},
-		{"wrong source", `{"data":[{"id":9,"host_id":7,"source_id":43}]}`, "application/json", 201, false},
-		{"missing IDs", `{}`, "application/json", 201, false},
-		{"trailing JSON", `{"data":[{"id":9,"host_id":7,"source_id":42}]} {}`, "application/json", 201, false},
-		{"oversized", strings.Repeat(" ", 16385), "application/json", 201, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			client, err := NewClient("https://central.example", "test-key")
-			if err != nil {
-				t.Fatal(err)
-			}
-			client.httpClient.Transport = transportFunc(func(r *http.Request) (*http.Response, error) {
-				var payload struct {
-					Stats []struct {
-						ID int64 `json:"id"`
-					} `json:"stats"`
-				}
-				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || len(payload.Stats) != 1 || payload.Stats[0].ID != 42 {
-					t.Fatal("persistent numeric source ID missing", err)
-				}
-				if r.Header.Get("X-API-Key") != "test-key" {
-					t.Fatal("missing authentication")
-				}
-				return &http.Response{StatusCode: tc.status, Header: http.Header{"Content-Type": {tc.contentType}}, Body: io.NopCloser(strings.NewReader(tc.body))}, nil
-			})
-			err = client.SendMachineStats(context.Background(), []models.MachineStat{validStat(42)})
-			if (err == nil) != tc.valid {
-				t.Fatalf("valid=%t err=%v", tc.valid, err)
-			}
-		})
-	}
-}
-
-func TestRedirectsNeverForwardCredentials(t *testing.T) {
-	for _, code := range []int{301, 302, 303, 307, 308} {
-		client, err := NewClient("https://central.example", "test-secret")
-		if err != nil {
-			t.Fatal(err)
-		}
-		calls := 0
-		client.httpClient.Transport = transportFunc(func(r *http.Request) (*http.Response, error) {
-			calls++
-			if r.URL.Host != "central.example" {
-				t.Fatal("credential-bearing request followed redirect")
-			}
-			return &http.Response{StatusCode: code, Header: http.Header{"Location": {"http://other.example/collect"}}, Body: io.NopCloser(strings.NewReader(""))}, nil
-		})
-		if err := client.SendMachineStats(context.Background(), []models.MachineStat{validStat(1)}); err == nil || calls != 1 {
-			t.Fatal("redirect must fail with a single request")
-		}
-	}
-}
-
-func TestErrorIDsAndCompleteAcknowledgement(t *testing.T) {
-	for _, response := range []struct {
-		body  string
-		valid bool
-	}{
-		{`{"accepted":1,"inserted":1,"duplicates":0,"source_ids":[12]}`, true},
-		{`{"accepted":1,"inserted":0,"duplicates":1,"source_ids":[12]}`, true},
-		{`{"accepted":0,"inserted":0,"duplicates":0}`, false},
-		{`{"accepted":1}`, false},
-		{`{"accepted":1,"inserted":1,"duplicates":0,"source_ids":[13]}`, false},
-	} {
-		client, err := NewClient("https://central.example", "test-key")
-		if err != nil {
-			t.Fatal(err)
-		}
-		client.httpClient.Transport = transportFunc(func(r *http.Request) (*http.Response, error) {
-			var payload struct {
-				Errors []struct {
-					ID int64 `json:"id"`
-				} `json:"errors"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || len(payload.Errors) != 1 || payload.Errors[0].ID != 12 {
-				t.Fatal("numeric error contract mismatch", err)
-			}
-			return &http.Response{StatusCode: 201, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(response.body))}, nil
-		})
-		err = client.SendErrorLogs(context.Background(), []models.ErrorLog{validError(12)})
-		if (err == nil) != response.valid {
-			t.Fatal("unexpected acknowledgement result", err)
-		}
-	}
-}
 
 func validStat(id int64) models.MachineStat {
 	return models.MachineStat{ID: id, CPUPercent: 25, RAMUsedMB: 1, RAMTotalMB: 2, DiskUsedGB: 1, DiskTotalGB: 2, CollectedAt: time.Now().UTC().Add(-time.Second)}
@@ -121,161 +25,229 @@ func validError(id int64) models.ErrorLog {
 	return models.ErrorLog{ID: id, AppName: "app", Environment: "test", Level: "ERROR", Message: "failure", CreatedAt: time.Now().UTC().Add(-time.Second)}
 }
 
-func TestFullBatchesUseOneRequestAndRetainNumericIDs(t *testing.T) {
-	for _, kind := range []string{"stats", "errors"} {
-		t.Run(kind, func(t *testing.T) {
-			client, err := NewClient("https://central.example", "test-key")
-			if err != nil {
-				t.Fatal(err)
+func TestStatsCarryKeyAndSourceIDAndRequireAMatchingAcknowledgement(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		ack   func(*ingestv1.IngestStatsRequest) *ingestv1.IngestStatsResponse
+		valid bool
+	}{
+		{"valid", func(r *ingestv1.IngestStatsRequest) *ingestv1.IngestStatsResponse { return requeststest.AckStats(r, 7) }, true},
+		{"empty", func(*ingestv1.IngestStatsRequest) *ingestv1.IngestStatsResponse {
+			return &ingestv1.IngestStatsResponse{}
+		}, false},
+		{"wrong source", func(*ingestv1.IngestStatsRequest) *ingestv1.IngestStatsResponse {
+			return &ingestv1.IngestStatsResponse{Acknowledgements: []*ingestv1.StatAcknowledgement{{Id: 9, HostId: 7, SourceId: 43}}}
+		}, false},
+		{"missing central ID", func(*ingestv1.IngestStatsRequest) *ingestv1.IngestStatsResponse {
+			return &ingestv1.IngestStatsResponse{Acknowledgements: []*ingestv1.StatAcknowledgement{{HostId: 7, SourceId: 42}}}
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			central := &requeststest.Central{Stats: func(r *ingestv1.IngestStatsRequest) (*ingestv1.IngestStatsResponse, error) {
+				if ids := requeststest.StatIDs(r); len(ids) != 1 || ids[0] != 42 {
+					t.Errorf("persistent numeric source ID missing: %v", ids)
+				}
+				return tc.ack(r), nil
+			}}
+			err := requeststest.Start(t, central, "test-key").SendMachineStats(context.Background(), []models.MachineStat{validStat(42)})
+			if (err == nil) != tc.valid {
+				t.Fatalf("valid=%t err=%v", tc.valid, err)
 			}
-			var stats []models.MachineStat
-			var logs []models.ErrorLog
-			for i := int64(0); i < 100; i++ {
-				id := int64(1<<63-1) - i
-				stats = append(stats, validStat(id))
-				logs = append(logs, validError(id))
-			}
-			calls := 0
-			client.httpClient.Transport = transportFunc(func(r *http.Request) (*http.Response, error) {
-				calls++
-				var payload struct {
-					Stats  []machineStatusPayload `json:"stats"`
-					Errors []errorLogPayload      `json:"errors"`
-				}
-				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-					t.Fatal(err)
-				}
-				var ack any
-				if kind == "stats" {
-					if len(payload.Stats) != 100 {
-						t.Fatal("statistics were not batched")
-					}
-					data := make([]map[string]int64, 0, 100)
-					for i, stat := range payload.Stats {
-						if stat.ID != stats[i].ID {
-							t.Fatal("source ID or order changed")
-						}
-						data = append(data, map[string]int64{"id": stat.ID, "host_id": 1<<63 - 1, "source_id": stat.ID})
-					}
-					ack = map[string]any{"data": data}
-				} else {
-					if len(payload.Errors) != 100 {
-						t.Fatal("errors were not batched")
-					}
-					ids := make([]int64, 0, 100)
-					for i, entry := range payload.Errors {
-						if entry.ID != logs[i].ID {
-							t.Fatal("source ID or order changed")
-						}
-						ids = append(ids, entry.ID)
-					}
-					ack = map[string]any{"accepted": 100, "inserted": 50, "duplicates": 50, "source_ids": ids}
-				}
-				body, err := json.Marshal(ack)
-				if err != nil {
-					t.Fatal(err)
-				}
-				return &http.Response{StatusCode: 201, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(string(body)))}, nil
-			})
-			if kind == "stats" {
-				err = client.SendMachineStats(context.Background(), stats)
-			} else {
-				err = client.SendErrorLogs(context.Background(), logs)
-			}
-			if err != nil || calls != 1 {
-				t.Fatal("expected one HTTP request for 100 records", calls, err)
+			if keys := central.Keys(); len(keys) != 1 || keys[0] != "test-key" {
+				t.Fatalf("host key not sent once: %v", keys)
 			}
 		})
+	}
+}
+
+func TestErrorAcknowledgementMustAccountForEverySourceID(t *testing.T) {
+	for _, tc := range []struct {
+		resp  *ingestv1.IngestErrorsResponse
+		valid bool
+	}{
+		{&ingestv1.IngestErrorsResponse{Accepted: 1, Inserted: 1, SourceIds: []int64{12}}, true},
+		{&ingestv1.IngestErrorsResponse{Accepted: 1, Duplicates: 1, SourceIds: []int64{12}}, true},
+		{&ingestv1.IngestErrorsResponse{}, false},
+		{&ingestv1.IngestErrorsResponse{Accepted: 1}, false},
+		{&ingestv1.IngestErrorsResponse{Accepted: 1, Inserted: 1, SourceIds: []int64{13}}, false},
+	} {
+		central := &requeststest.Central{Errors: func(*ingestv1.IngestErrorsRequest) (*ingestv1.IngestErrorsResponse, error) { return tc.resp, nil }}
+		err := requeststest.Start(t, central, "k").SendErrorLogs(context.Background(), []models.ErrorLog{validError(12)})
+		if (err == nil) != tc.valid {
+			t.Fatalf("response %v: unexpected result %v", tc.resp, err)
+		}
+	}
+}
+
+func TestLevelIsSentAsTheContractEnum(t *testing.T) {
+	var got ingestv1.LogLevel
+	central := &requeststest.Central{Errors: func(r *ingestv1.IngestErrorsRequest) (*ingestv1.IngestErrorsResponse, error) {
+		got = r.GetErrors()[0].GetLevel()
+		return requeststest.AckErrors(r, 1), nil
+	}}
+	entry := validError(1)
+	entry.Level = " critical " // accepted by local validation; normalized on the wire
+	if err := requeststest.Start(t, central, "k").SendErrorLogs(context.Background(), []models.ErrorLog{entry}); err != nil {
+		t.Fatal(err)
+	}
+	if got != ingestv1.LogLevel_LOG_LEVEL_CRITICAL {
+		t.Fatalf("level sent as %v", got)
+	}
+}
+
+func TestFullBatchesUseOneRequestAndRetainNumericIDs(t *testing.T) {
+	var stats []models.MachineStat
+	var logs []models.ErrorLog
+	for i := int64(0); i < 100; i++ {
+		id := int64(1<<63-1) - i
+		stats = append(stats, validStat(id))
+		logs = append(logs, validError(id))
+	}
+	central := &requeststest.Central{
+		Stats: func(r *ingestv1.IngestStatsRequest) (*ingestv1.IngestStatsResponse, error) {
+			for i, id := range requeststest.StatIDs(r) {
+				if id != stats[i].ID {
+					t.Error("source ID or order changed")
+				}
+			}
+			return requeststest.AckStats(r, 1<<63-1), nil
+		},
+		Errors: func(r *ingestv1.IngestErrorsRequest) (*ingestv1.IngestErrorsResponse, error) {
+			for i, id := range requeststest.ErrorIDs(r) {
+				if id != logs[i].ID {
+					t.Error("source ID or order changed")
+				}
+			}
+			return requeststest.AckErrors(r, 50), nil
+		},
+	}
+	client := requeststest.Start(t, central, "k")
+	if err := client.SendMachineStats(context.Background(), stats); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SendErrorLogs(context.Background(), logs); err != nil {
+		t.Fatal(err)
+	}
+	if central.Calls() != 2 {
+		t.Fatalf("expected one request per 100-record batch, got %d", central.Calls())
 	}
 }
 
 func TestBatchAcknowledgementCannotRepeatOrOmitMembers(t *testing.T) {
-	for _, tc := range []struct{ kind, body string }{
-		{"stats", `{"data":[{"id":9,"host_id":7,"source_id":2}]}`},
-		{"stats", `{"data":[{"id":9,"host_id":7,"source_id":2},{"id":10,"host_id":7,"source_id":2}]}`},
-		{"stats", `{"data":[{"id":9,"host_id":7,"source_id":2},{"id":9,"host_id":7,"source_id":1}]}`},
-		{"stats", `{"data":[{"id":9,"host_id":7,"source_id":2},{"id":10,"host_id":8,"source_id":1}]}`},
-		{"errors", `{"accepted":2,"inserted":2,"duplicates":0,"source_ids":[2]}`},
-		{"errors", `{"accepted":2,"inserted":2,"duplicates":0,"source_ids":[2,2]}`},
-		{"errors", `{"accepted":2,"inserted":2,"duplicates":0,"source_ids":[2,3]}`},
+	ack := func(ids ...[2]int64) *ingestv1.IngestStatsResponse { // {central id, source id}, host 7
+		resp := &ingestv1.IngestStatsResponse{}
+		for _, id := range ids {
+			resp.Acknowledgements = append(resp.Acknowledgements, &ingestv1.StatAcknowledgement{Id: id[0], HostId: 7, SourceId: id[1]})
+		}
+		return resp
+	}
+	mixedHosts := ack([2]int64{9, 2}, [2]int64{10, 1})
+	mixedHosts.Acknowledgements[1].HostId = 8
+	for name, resp := range map[string]*ingestv1.IngestStatsResponse{
+		"omitted":         ack([2]int64{9, 2}),
+		"repeated source": ack([2]int64{9, 2}, [2]int64{10, 2}),
+		"repeated id":     ack([2]int64{9, 2}, [2]int64{9, 1}),
+		"two hosts":       mixedHosts,
 	} {
-		client, err := NewClient("https://central.example", "test-key")
-		if err != nil {
-			t.Fatal(err)
+		central := &requeststest.Central{Stats: func(*ingestv1.IngestStatsRequest) (*ingestv1.IngestStatsResponse, error) { return resp, nil }}
+		if err := requeststest.Start(t, central, "k").SendMachineStats(context.Background(), []models.MachineStat{validStat(2), validStat(1)}); err == nil {
+			t.Fatalf("%s: inconsistent acknowledgement accepted", name)
 		}
-		client.httpClient.Transport = transportFunc(func(*http.Request) (*http.Response, error) {
-			return &http.Response{StatusCode: 201, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(tc.body))}, nil
-		})
-		if tc.kind == "stats" {
-			err = client.SendMachineStats(context.Background(), []models.MachineStat{validStat(2), validStat(1)})
-		} else {
-			err = client.SendErrorLogs(context.Background(), []models.ErrorLog{validError(2), validError(1)})
-		}
-		if err == nil {
-			t.Fatal("incomplete or inconsistent batch acknowledgement accepted", tc.body)
+	}
+	for name, resp := range map[string]*ingestv1.IngestErrorsResponse{
+		"omitted":  {Accepted: 2, Inserted: 2, SourceIds: []int64{2}},
+		"repeated": {Accepted: 2, Inserted: 2, SourceIds: []int64{2, 2}},
+		"foreign":  {Accepted: 2, Inserted: 2, SourceIds: []int64{2, 3}},
+	} {
+		central := &requeststest.Central{Errors: func(*ingestv1.IngestErrorsRequest) (*ingestv1.IngestErrorsResponse, error) { return resp, nil }}
+		if err := requeststest.Start(t, central, "k").SendErrorLogs(context.Background(), []models.ErrorLog{validError(2), validError(1)}); err == nil {
+			t.Fatalf("%s: inconsistent acknowledgement accepted", name)
 		}
 	}
 }
 
-func TestFailureClassificationDoesNotQuarantineDeliveryProblems(t *testing.T) {
+func TestFailureClassificationUsesOnlyContractCodes(t *testing.T) {
 	for _, tc := range []struct {
-		name, body    string
-		status        int
+		name          string
+		err           error
 		record, pause bool
+		split         bool
+		retryAfter    time.Duration
 	}{
-		{"record rejected", `{"error":"invalid_data","message":"timestamp cannot be in the future","source_id":42}`, 400, true, false},
-		{"unscoped rejection", `{"error":"invalid_data","message":"timestamp cannot be in the future"}`, 400, false, true},
-		{"contract mismatch", `{"error":"invalid_request"}`, 400, false, true},
-		{"plain proxy rejection", `upstream error`, 400, false, true},
-		{"credential rejected", "", 401, false, true},
-		{"access denied", "", 403, false, true},
-		{"wrong endpoint", "", 404, false, true},
-		{"temporary failure", "", 503, false, false},
-		{"rate limited", "", 429, false, false},
-		{"unexpected success", "", 200, false, false},
+		{"record rejected", requeststest.Reject(42, ingestv1.RejectionReason_REJECTION_REASON_FUTURE_TIMESTAMP), true, false, false, 0},
+		{"rejection without source", requeststest.Reject(0, ingestv1.RejectionReason_REJECTION_REASON_FUTURE_TIMESTAMP), false, true, false, 0},
+		{"malformed batch", status.Error(codes.InvalidArgument, "duplicate source ID in batch"), false, true, false, 0},
+		{"credential rejected", status.Error(codes.Unauthenticated, ""), false, true, false, 0},
+		{"access denied", status.Error(codes.PermissionDenied, ""), false, true, false, 0},
+		{"wrong service", status.Error(codes.Unimplemented, ""), false, true, false, 0},
+		{"temporary failure", status.Error(codes.Unavailable, ""), false, false, false, 0},
+		{"internal failure", status.Error(codes.Internal, ""), false, false, false, 0},
+		{"overloaded", requeststest.RetryLater(codes.ResourceExhausted, time.Minute), false, false, false, time.Minute},
+		{"unavailable with hint", requeststest.RetryLater(codes.Unavailable, 30*time.Second), false, false, false, 30 * time.Second},
+		{"message too large", status.Error(codes.ResourceExhausted, "grpc: received message larger than max"), false, false, true, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := responseFailure(&http.Response{StatusCode: tc.status, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(tc.body))})
+			central := &requeststest.Central{Stats: func(*ingestv1.IngestStatsRequest) (*ingestv1.IngestStatsResponse, error) { return nil, tc.err }}
+			err := requeststest.Start(t, central, "k").SendMachineStats(context.Background(), []models.MachineStat{validStat(42)})
 			var record *validation.RecordError
 			if errors.As(err, &record) != tc.record {
-				t.Fatalf("unexpected record classification: %v", err)
+				t.Fatalf("record classification: %v", err)
 			}
-			if !tc.record {
-				var delivery *DeliveryError
-				if !errors.As(err, &delivery) || delivery.Pause != tc.pause {
-					t.Fatalf("unexpected delivery classification: %v", err)
+			if tc.record {
+				if record.SourceID != 42 || record.Reason != "central rejected record: future_timestamp" || strings.Contains(record.Reason, "private") {
+					t.Fatalf("reason must come from the code only: %+v", record)
 				}
+				return
+			}
+			if errors.Is(err, requests.ErrBatchBodyTooLarge) != tc.split {
+				t.Fatalf("split classification: %v", err)
+			}
+			if tc.split {
+				return
+			}
+			var delivery *requests.DeliveryError
+			if !errors.As(err, &delivery) || delivery.Pause != tc.pause || delivery.RetryAfter != tc.retryAfter {
+				t.Fatalf("delivery classification: %+v (%v)", delivery, err)
 			}
 		})
 	}
 }
 
-func TestRetryAfterAndSafeReason(t *testing.T) {
-	if err := responseFailure(&http.Response{StatusCode: 413, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"error":"body_too_large"}`))}); !errors.Is(err, ErrBatchBodyTooLarge) {
-		t.Fatal("oversized batch must split instead of quarantining every member", err)
+func TestOversizedBatchIsDetectedBeforeSending(t *testing.T) {
+	central := &requeststest.Central{}
+	entry := validError(1)
+	entry.Message = strings.Repeat("m", 16384)
+	stack := strings.Repeat("s", 65536)
+	entry.StackTrace = &stack
+	logs := make([]models.ErrorLog, 0, 20)
+	for i := int64(1); i <= 20; i++ {
+		e := entry
+		e.ID = i
+		logs = append(logs, e)
 	}
-	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
-	for _, tc := range []struct {
-		value string
-		want  time.Duration
-	}{
-		{"60", time.Minute}, {"-1", 0}, {"invalid", 0},
-		{now.Add(2 * time.Minute).Format(http.TimeFormat), 2 * time.Minute},
-		{now.Add(-time.Minute).Format(http.TimeFormat), 0},
-	} {
-		if got := retryAfter(tc.value, now); got != tc.want {
-			t.Fatalf("Retry-After %q: %s, want %s", tc.value, got, tc.want)
-		}
-	}
-	if reason := safeRecordReason("echoed-private-credential"); strings.Contains(reason, "private") {
-		t.Fatal("untrusted response text persisted")
+	err := requeststest.Start(t, central, "k").SendErrorLogs(context.Background(), logs)
+	if !errors.Is(err, requests.ErrBatchBodyTooLarge) || central.Calls() != 0 {
+		t.Fatalf("want local size rejection without a request, got %v after %d calls", err, central.Calls())
 	}
 }
 
-func TestClientRejectsUnsafeURLs(t *testing.T) {
-	for _, base := range []string{"http://remote.example", "https://user:pass@central.example", "https://central.example?x=y", "https://central.example#fragment"} {
-		if _, err := NewClient(base, "key"); err == nil {
-			t.Fatalf("unsafe URL accepted: %s", base)
+func TestClientRejectsUnsafeAddresses(t *testing.T) {
+	for _, address := range []string{
+		"http://remote.example:3334", "https://user:pass@central.example", "https://central.example?x=y",
+		"https://central.example#fragment", "https://central.example/ingest", "ftp://central.example", "central.example:3334",
+	} {
+		if _, err := requests.NewClient(address, "key"); err == nil {
+			t.Fatalf("unsafe address accepted: %s", address)
 		}
+	}
+	for _, address := range []string{"https://central.example", "https://central.example:8443", "http://localhost:3334", "http://127.0.0.1:3334"} {
+		client, err := requests.NewClient(address, "key")
+		if err != nil {
+			t.Fatalf("valid address rejected: %s: %v", address, err)
+		}
+		_ = client.Close()
+	}
+	if _, err := requests.NewClient("https://central.example", " "); err == nil {
+		t.Fatal("empty host key accepted")
 	}
 }

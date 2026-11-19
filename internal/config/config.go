@@ -36,12 +36,12 @@ func Load() (*Config, error) {
 	_ = godotenv.Load()
 
 	centralURL := strings.TrimRight(
-		strings.TrimSpace(os.Getenv("CENTRAL_URL")),
+		strings.TrimSpace(os.Getenv("CENTRAL_GRPC_URL")),
 		"/",
 	)
 	if centralURL == "" {
 		return nil, fmt.Errorf(
-			"CENTRAL_URL is required",
+			"CENTRAL_GRPC_URL is required (gRPC ingestion endpoint, e.g. https://central.example:443)",
 		)
 	}
 
@@ -50,7 +50,7 @@ func Load() (*Config, error) {
 		parsedURL.Scheme == "" ||
 		parsedURL.Host == "" {
 		return nil, fmt.Errorf(
-			"CENTRAL_URL must be a valid URL",
+			"CENTRAL_GRPC_URL must be a valid URL",
 		)
 	}
 
@@ -58,7 +58,7 @@ func Load() (*Config, error) {
 		!(parsedURL.Scheme == "http" &&
 			isLocalHost(parsedURL.Hostname())) {
 		return nil, fmt.Errorf(
-			"CENTRAL_URL must use HTTPS outside localhost",
+			"CENTRAL_GRPC_URL must use HTTPS outside localhost",
 		)
 	}
 

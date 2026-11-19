@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"google.golang.org/grpc/codes"
+
 	"monitor-remote/internal/requests"
 	"monitor-remote/internal/validation"
 )
@@ -56,7 +58,7 @@ func deliverBatch[T any](ctx context.Context, s *Sender, batch []pendingDelivery
 				}
 			}
 			if index < 0 {
-				contractErr := &requests.DeliveryError{StatusCode: 400, Pause: true}
+				contractErr := &requests.DeliveryError{Code: codes.InvalidArgument, Pause: true}
 				s.observeFailure(contractErr)
 				return fmt.Errorf("central rejection did not identify a submitted source ID: %w", contractErr)
 			}

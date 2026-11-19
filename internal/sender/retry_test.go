@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+
 	"monitor-remote/internal/requests"
 )
 
@@ -26,13 +28,13 @@ func TestRetryDelaysAndCancellation(t *testing.T) {
 
 func TestRetryAfterIsSharedAndNotCappedByBackoff(t *testing.T) {
 	s := &Sender{}
-	s.observeFailure(&requests.DeliveryError{StatusCode: 429, RetryAfter: time.Hour})
+	s.observeFailure(&requests.DeliveryError{Code: codes.ResourceExhausted, RetryAfter: time.Hour})
 	var limited *requests.DeliveryError
 	if err := s.deliveryGate(); !errors.As(err, &limited) || limited.RetryAfter < 59*time.Minute {
 		t.Fatal("Retry-After was ignored or capped", err)
 	}
 	// A shorter second response must never shorten an already imposed cooldown.
-	s.observeFailure(&requests.DeliveryError{StatusCode: 429, RetryAfter: time.Second})
+	s.observeFailure(&requests.DeliveryError{Code: codes.ResourceExhausted, RetryAfter: time.Second})
 	if err := s.deliveryGate(); !errors.As(err, &limited) || limited.RetryAfter < 59*time.Minute {
 		t.Fatal("cooldown was shortened", err)
 	}
