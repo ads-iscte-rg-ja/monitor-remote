@@ -6,7 +6,7 @@ to [central](../monitor-central/README.md).
 
 ## Requirements
 
-- Go 1.25+ and a C compiler, with **`CGO_ENABLED=1`** for SQLite.
+- Go 1.26+ and a C compiler, with **`CGO_ENABLED=1`** for SQLite.
 - A host registered in central and its API key.
 - A persistent, writable SQLite path shared with the monitored applications.
 
@@ -22,7 +22,7 @@ chmod 600 .env
 Edit `.env`:
 
 ```env
-CENTRAL_URL=http://localhost:3333
+CENTRAL_GRPC_URL=http://localhost:3334
 HOST_API_KEY=replace-with-the-key-from-central
 SQLITE_PATH=remote-monitor.db
 COLLECTION_INTERVAL=30s
@@ -34,7 +34,9 @@ CLEANUP_INTERVAL=1h
 CLEANUP_BATCH_SIZE=1000
 ```
 
-Use HTTPS when central is outside localhost/loopback. An absolute `SQLITE_PATH`
+`CENTRAL_GRPC_URL` is central's gRPC ingestion endpoint (`GRPC_PORT`, not the
+dashboard port). Use `https://` when central is outside localhost/loopback; the
+default port is then 443. An absolute `SQLITE_PATH`
 is convenient when applications run from different working directories.
 Environment variables override `.env` values.
 
@@ -64,14 +66,16 @@ CGO_ENABLED=1 go run ./cmd/seed/main
 
 Intervals are waits after completed cycles. Error delivery polls SQLite; SDK
 writes do not notify the agent. Each delivery cycle flushes its starting backlog
-**newest first, up to 100 records per HTTP request**, without waiting between
+**newest first, up to 100 records per gRPC request**, without waiting between
 batches. New writes during a flush enter the next cycle. Large payloads are
-split to respect central's 1 MiB request limit.
+split to respect the contract's 1 MiB message limit. The contract and its error
+codes live in [monitor-api](https://github.com/ads-iscte-rg-ja/monitor-api).
 
 - Valid acknowledgements mark records delivered; failures leave them pending.
-- Temporary failures retry with backoff and respect `Retry-After`.
+- Temporary failures retry with backoff and respect central's `RetryInfo`.
 - Credential/configuration failures pause delivery until corrected and restarted.
-- Invalid individual records retain their payload and a quarantine reason.
+- Invalid individual records retain their payload and a quarantine reason taken
+  from the contract's stable rejection code, never from central's message text.
 - Delivered records are cleaned after seven days by default. Set
   `SENT_RETENTION_DAYS=0` to disable cleanup. Pending and quarantined records are
   never automatically deleted.
@@ -81,7 +85,7 @@ split to respect central's 1 MiB request limit.
 Use the [Go SDK](../monitor-go-sdk/README.md) or
 [hello-world example](../monitor-hello-world/README.md) with the **same SQLite
 file**. Remote and applications normally run under the same OS user to access
-the private buffer. Applications need neither the central URL nor the host key.
+the private buffer. Applications need neither the central address nor the host key.
 
 Keep this file across restarts. There are no SQLite migrations or automatic
 resets; incompatible buffers are rejected. A fresh independent buffer needs a

@@ -54,6 +54,7 @@ func main() {
 	if err != nil {
 		logger.Fatalf("create central client: %v", err)
 	}
+	defer func() { _ = requestClient.Close() }()
 
 	deliverySender := sender.New(
 		queueRepository,

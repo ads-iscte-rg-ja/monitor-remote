@@ -2,62 +2,77 @@ package sender
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	ingestv1 "github.com/ads-iscte-rg-ja/monitor-api/gen/go/monitor/ingest/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"monitor-remote/internal/database"
 	"monitor-remote/internal/models"
 	"monitor-remote/internal/repository"
-	"monitor-remote/internal/requests"
+	"monitor-remote/internal/requests/requeststest"
 )
+
+func openRepo(t *testing.T, name string) (*repository.QueueRepository, func(query string, args ...any) int) {
+	t.Helper()
+	db, err := database.Open(filepath.Join(t.TempDir(), name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	count := func(query string, args ...any) int {
+		t.Helper()
+		var n int
+		if err := db.QueryRow(query, args...).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	return repository.NewQueueRepository(db), count
+}
+
+func saveError(t *testing.T, repo *repository.QueueRepository, entry *models.ErrorLog) {
+	t.Helper()
+	if entry == nil {
+		entry = &models.ErrorLog{AppName: "app", Environment: "test", Level: "ERROR", Message: "failure"}
+	}
+	if err := repo.SaveErrorLog(context.Background(), entry); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func saveStat(t *testing.T, repo *repository.QueueRepository) *models.MachineStat {
+	t.Helper()
+	stat := &models.MachineStat{CPUPercent: 25, RAMUsedMB: 1, RAMTotalMB: 2, DiskUsedGB: 1, DiskTotalGB: 2, CollectedAt: time.Now().UTC()}
+	if err := repo.SaveMachineStat(context.Background(), stat); err != nil {
+		t.Fatal(err)
+	}
+	return stat
+}
 
 func TestBadAcknowledgementRetainsRecordAndRetriesSameID(t *testing.T) {
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "buffer.db")
-	db, err := database.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	repo := repository.NewQueueRepository(db)
+	repo, _ := openRepo(t, "buffer.db")
 	entry := &models.ErrorLog{AppName: "app", Environment: "test", Level: "ERROR", Message: "failure"}
-	if err := repo.SaveErrorLog(ctx, entry); err != nil {
-		t.Fatal(err)
-	}
-	id := entry.ID
+	saveError(t, repo, entry)
 	calls := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	central := &requeststest.Central{Errors: func(r *ingestv1.IngestErrorsRequest) (*ingestv1.IngestErrorsResponse, error) {
 		calls++
-		var payload struct {
-			Errors []struct {
-				ID int64 `json:"id"`
-			} `json:"errors"`
+		if ids := requeststest.ErrorIDs(r); len(ids) != 1 || ids[0] != entry.ID {
+			t.Error("retry changed source identity", ids)
 		}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || len(payload.Errors) != 1 || payload.Errors[0].ID != id {
-			t.Error("retry changed source identity", err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(201)
 		if calls == 1 {
-			_, _ = w.Write([]byte(`{}`))
-			return
+			return &ingestv1.IngestErrorsResponse{}, nil
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"accepted": 1, "inserted": 0, "duplicates": 1, "source_ids": []int64{id}})
-	}))
-	defer server.Close()
-	client, err := requests.NewClient(server.URL, "test-key")
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := New(repo, client)
+		return requeststest.AckErrors(r, 0), nil // already stored: duplicate
+	}}
+	s := New(repo, requeststest.Start(t, central, "test-key"))
 	if err := s.SendPendingErrorLogs(ctx); err == nil {
 		t.Fatal("bad acknowledgement accepted")
 	}
@@ -89,9 +104,7 @@ func TestInvalidRecordsAreQuarantinedWithoutBlockingValidErrors(t *testing.T) {
 		if i == 3 {
 			entries[i].CreatedAt = time.Now().Add(time.Hour)
 		}
-		if err := repo.SaveErrorLog(ctx, &entries[i]); err != nil {
-			t.Fatal(err)
-		}
+		saveError(t, repo, &entries[i])
 	}
 	if _, err := db.Exec("UPDATE error_logs SET metadata='not JSON' WHERE id=?", entries[1].ID); err != nil {
 		t.Fatal(err)
@@ -100,46 +113,22 @@ func TestInvalidRecordsAreQuarantinedWithoutBlockingValidErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	seen := make(chan []int64, 10)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var payload struct {
-			Errors []struct {
-				ID int64 `json:"id"`
-			} `json:"errors"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || len(payload.Errors) == 0 {
-			t.Error("bad payload", err)
-			w.WriteHeader(500)
-			return
-		}
-		ids := make([]int64, 0, len(payload.Errors))
-		rejected := false
-		for _, entry := range payload.Errors {
-			ids = append(ids, entry.ID)
-			if entry.ID == entries[4].ID {
-				rejected = true
+	central := &requeststest.Central{Errors: func(r *ingestv1.IngestErrorsRequest) (*ingestv1.IngestErrorsResponse, error) {
+		ids := requeststest.ErrorIDs(r)
+		seen <- ids
+		for _, id := range ids {
+			if id == entries[4].ID {
+				return nil, requeststest.Reject(id, ingestv1.RejectionReason_REJECTION_REASON_FIELD_TOO_LARGE)
 			}
 		}
-		seen <- ids
-		w.Header().Set("Content-Type", "application/json")
-		if rejected {
-			w.WriteHeader(400)
-			_ = json.NewEncoder(w).Encode(map[string]any{"error": "invalid_data", "message": "monitoring field exceeds its size limit", "source_id": entries[4].ID})
-			return
-		}
-		w.WriteHeader(201)
-		_ = json.NewEncoder(w).Encode(map[string]any{"accepted": len(ids), "inserted": len(ids), "duplicates": 0, "source_ids": ids})
-	}))
-	defer server.Close()
-	client, err := requests.NewClient(server.URL, "test-key")
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := New(repo, client)
+		return requeststest.AckErrors(r, len(ids)), nil
+	}}
+	s := New(repo, requeststest.Start(t, central, "test-key"))
 	if err := s.SendPendingErrorLogs(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if len(seen) != 2 {
-		t.Fatalf("HTTP requests=%d want 2", len(seen))
+		t.Fatalf("requests=%d want 2", len(seen))
 	}
 	first, second := <-seen, <-seen
 	if len(first) != 2 || first[0] != entries[5].ID || first[1] != entries[4].ID || len(second) != 1 || second[0] != entries[5].ID {
@@ -158,6 +147,10 @@ func TestInvalidRecordsAreQuarantinedWithoutBlockingValidErrors(t *testing.T) {
 	if quarantined != 5 || sent != 1 || payloads != 6 {
 		t.Fatalf("quarantined=%d sent=%d payloads=%d", quarantined, sent, payloads)
 	}
+	var reason string
+	if err := db.QueryRow("SELECT quarantine_reason FROM delivery_status WHERE record_id=?", entries[4].ID).Scan(&reason); err != nil || reason != "central rejected record: field_too_large" {
+		t.Fatalf("quarantine reason must come from the contract code: %q %v", reason, err)
+	}
 	var metadata string
 	if err := db.QueryRow("SELECT metadata FROM error_logs WHERE id=?", entries[1].ID).Scan(&metadata); err != nil || metadata != "not JSON" {
 		t.Fatal("invalid payload was rewritten", err)
@@ -169,78 +162,48 @@ func TestInvalidRecordsAreQuarantinedWithoutBlockingValidErrors(t *testing.T) {
 
 func TestCredentialFailurePausesBothCategoriesWithoutQuarantine(t *testing.T) {
 	ctx := context.Background()
-	db, err := database.Open(filepath.Join(t.TempDir(), "auth.db"))
-	if err != nil {
-		t.Fatal(err)
+	repo, count := openRepo(t, "auth.db")
+	saveError(t, repo, nil)
+	saveStat(t, repo)
+	unauthenticated := status.Error(codes.Unauthenticated, "invalid or missing API key")
+	central := &requeststest.Central{
+		Errors: func(*ingestv1.IngestErrorsRequest) (*ingestv1.IngestErrorsResponse, error) {
+			return nil, unauthenticated
+		},
+		Stats: func(*ingestv1.IngestStatsRequest) (*ingestv1.IngestStatsResponse, error) { return nil, unauthenticated },
 	}
-	defer db.Close()
-	repo := repository.NewQueueRepository(db)
-	if err := repo.SaveErrorLog(ctx, &models.ErrorLog{AppName: "app", Environment: "test", Level: "ERROR", Message: "failure"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := repo.SaveMachineStat(ctx, &models.MachineStat{CPUPercent: 25, RAMUsedMB: 1, RAMTotalMB: 2, DiskUsedGB: 1, DiskTotalGB: 2}); err != nil {
-		t.Fatal(err)
-	}
-	seen := make(chan struct{}, 10)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { seen <- struct{}{}; w.WriteHeader(401) }))
-	defer server.Close()
-	client, err := requests.NewClient(server.URL, "revoked-test-key")
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := New(repo, client)
+	s := New(repo, requeststest.Start(t, central, "revoked-test-key"))
 	if err := s.SendPendingErrorLogs(ctx); err == nil {
 		t.Fatal("expected credential failure")
 	}
 	if err := s.SendPendingMachineStats(ctx); !errors.Is(err, errPaused) {
 		t.Fatal("shared credential pause not applied", err)
 	}
-	if len(seen) != 1 {
-		t.Fatal("paused delivery performed another HTTP request")
+	if central.Calls() != 1 {
+		t.Fatal("paused delivery performed another request")
 	}
-	var count int
-	if err := db.QueryRow("SELECT COUNT(*) FROM delivery_status WHERE sent_at IS NULL AND quarantine_reason IS NULL").Scan(&count); err != nil || count != 2 {
-		t.Fatal("valid records were discarded or quarantined", err)
+	if n := count("SELECT COUNT(*) FROM delivery_status WHERE sent_at IS NULL AND quarantine_reason IS NULL"); n != 2 {
+		t.Fatal("valid records were discarded or quarantined", n)
 	}
 }
 
 func TestStatisticsRetryKeepsPersistentSourceID(t *testing.T) {
 	ctx := context.Background()
-	db, err := database.Open(filepath.Join(t.TempDir(), "stats.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	repo := repository.NewQueueRepository(db)
-	stat := &models.MachineStat{CPUPercent: 25, RAMUsedMB: 1, RAMTotalMB: 2, DiskUsedGB: 1, DiskTotalGB: 2, CollectedAt: time.Now().UTC()}
-	if err := repo.SaveMachineStat(ctx, stat); err != nil {
-		t.Fatal(err)
-	}
+	repo, _ := openRepo(t, "stats.db")
+	stat := saveStat(t, repo)
 	calls := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	central := &requeststest.Central{Stats: func(r *ingestv1.IngestStatsRequest) (*ingestv1.IngestStatsResponse, error) {
 		calls++
-		var payload struct {
-			Stats []struct {
-				ID int64 `json:"id"`
-			} `json:"stats"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || len(payload.Stats) != 1 || payload.Stats[0].ID != stat.ID || payload.Stats[0].ID <= 0 {
-			t.Error("persistent statistics source ID changed", err)
+		if ids := requeststest.StatIDs(r); len(ids) != 1 || ids[0] != stat.ID || ids[0] <= 0 {
+			t.Error("persistent statistics source ID changed", ids)
 		}
 		ackID := stat.ID
 		if calls == 1 {
 			ackID++
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(201)
-		_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]int64{{"id": 99, "host_id": 7, "source_id": ackID}}})
-	}))
-	defer server.Close()
-	client, err := requests.NewClient(server.URL, "test-key")
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := New(repo, client)
+		return &ingestv1.IngestStatsResponse{Acknowledgements: []*ingestv1.StatAcknowledgement{{Id: 99, HostId: 7, SourceId: ackID}}}, nil
+	}}
+	s := New(repo, requeststest.Start(t, central, "test-key"))
 	if err := s.SendPendingMachineStats(ctx); err == nil {
 		t.Fatal("mismatched source ID accepted")
 	}
@@ -267,12 +230,9 @@ func TestFlushSendsAllPendingRecordsInNewestFirstBatches(t *testing.T) {
 			repo := repository.NewQueueRepository(db)
 			for i := 0; i < 101; i++ {
 				if kind == "stats" {
-					err = repo.SaveMachineStat(ctx, &models.MachineStat{CPUPercent: 25, RAMUsedMB: 1, RAMTotalMB: 2, DiskUsedGB: 1, DiskTotalGB: 2})
+					saveStat(t, repo)
 				} else {
-					err = repo.SaveErrorLog(ctx, &models.ErrorLog{AppName: "app", Environment: "test", Level: "ERROR", Message: "failure"})
-				}
-				if err != nil {
-					t.Fatal(err)
+					saveError(t, repo, nil)
 				}
 			}
 			// Also exercise the descending ID tie-breaker.
@@ -280,44 +240,17 @@ func TestFlushSendsAllPendingRecordsInNewestFirstBatches(t *testing.T) {
 				t.Fatal(err)
 			}
 			seen := make(chan []int64, 2)
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				var payload struct {
-					Stats []struct {
-						ID int64 `json:"id"`
-					} `json:"stats"`
-					Errors []struct {
-						ID int64 `json:"id"`
-					} `json:"errors"`
-				}
-				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-					t.Error(err)
-					w.WriteHeader(500)
-					return
-				}
-				ids := make([]int64, 0, 100)
-				data := make([]map[string]int64, 0, 100)
-				for _, entry := range payload.Stats {
-					ids = append(ids, entry.ID)
-					data = append(data, map[string]int64{"id": entry.ID, "host_id": 7, "source_id": entry.ID})
-				}
-				for _, entry := range payload.Errors {
-					ids = append(ids, entry.ID)
-				}
-				seen <- ids
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(201)
-				if kind == "stats" {
-					_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
-				} else {
-					_ = json.NewEncoder(w).Encode(map[string]any{"accepted": len(ids), "inserted": len(ids), "duplicates": 0, "source_ids": ids})
-				}
-			}))
-			defer server.Close()
-			client, err := requests.NewClient(server.URL, "test-key")
-			if err != nil {
-				t.Fatal(err)
+			central := &requeststest.Central{
+				Stats: func(r *ingestv1.IngestStatsRequest) (*ingestv1.IngestStatsResponse, error) {
+					seen <- requeststest.StatIDs(r)
+					return requeststest.AckStats(r, 7), nil
+				},
+				Errors: func(r *ingestv1.IngestErrorsRequest) (*ingestv1.IngestErrorsResponse, error) {
+					seen <- requeststest.ErrorIDs(r)
+					return requeststest.AckErrors(r, len(r.GetErrors())), nil
+				},
 			}
-			s := New(repo, client)
+			s := New(repo, requeststest.Start(t, central, "test-key"))
 			if kind == "stats" {
 				err = s.SendPendingMachineStats(ctx)
 			} else {
@@ -339,13 +272,12 @@ func TestFlushSendsAllPendingRecordsInNewestFirstBatches(t *testing.T) {
 			if len(last) != 1 || last[0] != 1 {
 				t.Fatal("flush did not reach the oldest record", last)
 			}
-			var pending int
+			var pending, sent int
 			if err := db.QueryRow("SELECT COUNT(*) FROM delivery_status WHERE sent_at IS NULL").Scan(&pending); err != nil || pending != 0 {
 				t.Fatal("cycle left an accepted backlog pending", pending, err)
 			}
-			var count int
-			if err := db.QueryRow("SELECT COUNT(*) FROM delivery_status WHERE sent_at IS NOT NULL").Scan(&count); err != nil || count != 101 {
-				t.Fatal("complete batch was not marked delivered", count, err)
+			if err := db.QueryRow("SELECT COUNT(*) FROM delivery_status WHERE sent_at IS NOT NULL").Scan(&sent); err != nil || sent != 101 {
+				t.Fatal("complete batch was not marked delivered", sent, err)
 			}
 		})
 	}
@@ -353,48 +285,20 @@ func TestFlushSendsAllPendingRecordsInNewestFirstBatches(t *testing.T) {
 
 func TestFlushLeavesConcurrentWritesForNextCycle(t *testing.T) {
 	ctx := context.Background()
-	db, err := database.Open(filepath.Join(t.TempDir(), "snapshot.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	repo := repository.NewQueueRepository(db)
-	save := func() error {
-		return repo.SaveErrorLog(ctx, &models.ErrorLog{AppName: "app", Environment: "test", Level: "ERROR", Message: "failure"})
-	}
-	if err := save(); err != nil {
-		t.Fatal(err)
-	}
+	repo, _ := openRepo(t, "snapshot.db")
+	saveError(t, repo, nil)
 	var once sync.Once
 	seen := make(chan int64, 4)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var payload struct {
-			Errors []struct {
-				ID int64 `json:"id"`
-			} `json:"errors"`
+	central := &requeststest.Central{Errors: func(r *ingestv1.IngestErrorsRequest) (*ingestv1.IngestErrorsResponse, error) {
+		ids := requeststest.ErrorIDs(r)
+		if len(ids) != 1 {
+			t.Error("invalid payload", ids)
 		}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || len(payload.Errors) != 1 {
-			t.Error("invalid payload", err)
-			w.WriteHeader(500)
-			return
-		}
-		once.Do(func() {
-			if err := save(); err != nil {
-				t.Error(err)
-			}
-		})
-		id := payload.Errors[0].ID
-		seen <- id
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(201)
-		_ = json.NewEncoder(w).Encode(map[string]any{"accepted": 1, "inserted": 1, "duplicates": 0, "source_ids": []int64{id}})
-	}))
-	defer server.Close()
-	client, err := requests.NewClient(server.URL, "test-key")
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := New(repo, client)
+		once.Do(func() { saveError(t, repo, nil) })
+		seen <- ids[0]
+		return requeststest.AckErrors(r, 1), nil
+	}}
+	s := New(repo, requeststest.Start(t, central, "test-key"))
 	if err := s.SendPendingErrorLogs(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -415,54 +319,24 @@ func TestFlushLeavesConcurrentWritesForNextCycle(t *testing.T) {
 
 func TestFlushStopsOnFailureAndRetriesOnlyRemainingBacklog(t *testing.T) {
 	ctx := context.Background()
-	db, err := database.Open(filepath.Join(t.TempDir(), "flush-retry.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	repo := repository.NewQueueRepository(db)
+	repo, count := openRepo(t, "flush-retry.db")
 	for i := 0; i < 201; i++ {
-		if err := repo.SaveErrorLog(ctx, &models.ErrorLog{AppName: "app", Environment: "test", Level: "ERROR", Message: "failure"}); err != nil {
-			t.Fatal(err)
-		}
+		saveError(t, repo, nil)
 	}
 	calls := make(chan []int64, 6)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var payload struct {
-			Errors []struct {
-				ID int64 `json:"id"`
-			} `json:"errors"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			t.Error(err)
-			w.WriteHeader(500)
-			return
-		}
-		ids := make([]int64, 0, len(payload.Errors))
-		for _, entry := range payload.Errors {
-			ids = append(ids, entry.ID)
-		}
-		calls <- ids
+	central := &requeststest.Central{Errors: func(r *ingestv1.IngestErrorsRequest) (*ingestv1.IngestErrorsResponse, error) {
+		calls <- requeststest.ErrorIDs(r)
 		if len(calls) == 2 {
-			w.WriteHeader(503)
-			return
+			return nil, status.Error(codes.Unavailable, "central restarting")
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(201)
-		_ = json.NewEncoder(w).Encode(map[string]any{"accepted": len(ids), "inserted": len(ids), "duplicates": 0, "source_ids": ids})
-	}))
-	defer server.Close()
-	client, err := requests.NewClient(server.URL, "test-key")
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := New(repo, client)
+		return requeststest.AckErrors(r, len(r.GetErrors())), nil
+	}}
+	s := New(repo, requeststest.Start(t, central, "test-key"))
 	if err := s.SendPendingErrorLogs(ctx); err == nil || len(calls) != 2 {
 		t.Fatal("failure did not stop the flush", err)
 	}
-	var pending int
-	if err := db.QueryRow("SELECT COUNT(*) FROM delivery_status WHERE sent_at IS NULL AND quarantine_reason IS NULL").Scan(&pending); err != nil || pending != 101 {
-		t.Fatal("remaining backlog was not preserved", pending, err)
+	if n := count("SELECT COUNT(*) FROM delivery_status WHERE sent_at IS NULL AND quarantine_reason IS NULL"); n != 101 {
+		t.Fatal("remaining backlog was not preserved", n)
 	}
 	if err := s.SendPendingErrorLogs(ctx); err != nil || len(calls) != 4 {
 		t.Fatal("retry did not drain the remaining two batches", err)
@@ -475,51 +349,17 @@ func TestFlushStopsOnFailureAndRetriesOnlyRemainingBacklog(t *testing.T) {
 
 func TestOversizedCombinedPayloadSplitsWithoutQuarantine(t *testing.T) {
 	ctx := context.Background()
-	db, err := database.Open(filepath.Join(t.TempDir(), "large-batch.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	repo := repository.NewQueueRepository(db)
+	repo, count := openRepo(t, "large-batch.db")
 	stack := strings.Repeat("s", 65536)
 	for i := 0; i < 24; i++ {
-		if err := repo.SaveErrorLog(ctx, &models.ErrorLog{AppName: "app", Environment: "test", Level: "ERROR", Message: strings.Repeat("m", 16384), StackTrace: &stack}); err != nil {
-			t.Fatal(err)
-		}
+		saveError(t, repo, &models.ErrorLog{AppName: "app", Environment: "test", Level: "ERROR", Message: strings.Repeat("m", 16384), StackTrace: &stack})
 	}
 	seen := make(chan []int64, 10)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(io.LimitReader(r.Body, 1048577))
-		if err != nil || len(body) > 1048576 {
-			t.Error("request exceeded body limit", err)
-			w.WriteHeader(500)
-			return
-		}
-		var payload struct {
-			Errors []struct {
-				ID int64 `json:"id"`
-			} `json:"errors"`
-		}
-		if err := json.Unmarshal(body, &payload); err != nil {
-			t.Error(err)
-			w.WriteHeader(500)
-			return
-		}
-		ids := make([]int64, 0, len(payload.Errors))
-		for _, entry := range payload.Errors {
-			ids = append(ids, entry.ID)
-		}
-		seen <- ids
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(201)
-		_ = json.NewEncoder(w).Encode(map[string]any{"accepted": len(ids), "inserted": len(ids), "duplicates": 0, "source_ids": ids})
-	}))
-	defer server.Close()
-	client, err := requests.NewClient(server.URL, "test-key")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := New(repo, client).SendPendingErrorLogs(ctx); err != nil {
+	central := &requeststest.Central{Errors: func(r *ingestv1.IngestErrorsRequest) (*ingestv1.IngestErrorsResponse, error) {
+		seen <- requeststest.ErrorIDs(r)
+		return requeststest.AckErrors(r, len(r.GetErrors())), nil
+	}}
+	if err := New(repo, requeststest.Start(t, central, "test-key")).SendPendingErrorLogs(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if len(seen) != 2 {
@@ -534,49 +374,32 @@ func TestOversizedCombinedPayloadSplitsWithoutQuarantine(t *testing.T) {
 			t.Fatal("split changed newest-first ordering", ids)
 		}
 	}
-	var count int
-	if err := db.QueryRow("SELECT COUNT(*) FROM delivery_status WHERE sent_at IS NOT NULL AND quarantine_reason IS NULL").Scan(&count); err != nil || count != 24 {
-		t.Fatal("valid records were quarantined or retained", count, err)
+	if n := count("SELECT COUNT(*) FROM delivery_status WHERE sent_at IS NOT NULL AND quarantine_reason IS NULL"); n != 24 {
+		t.Fatal("valid records were quarantined or retained", n)
 	}
 }
 
 func TestUnidentifiedBatchRejectionNeverQuarantinesMembers(t *testing.T) {
-	for _, body := range []string{
-		`{"error":"invalid_data","message":"timestamp cannot be in the future","source_id":999}`,
-		`{"error":"invalid_data","message":"timestamp cannot be in the future"}`,
+	for name, rejection := range map[string]error{
+		"foreign source": requeststest.Reject(999, ingestv1.RejectionReason_REJECTION_REASON_FUTURE_TIMESTAMP),
+		"no source":      status.Error(codes.InvalidArgument, "statistics batch cannot be empty"),
 	} {
-		ctx := context.Background()
-		db, err := database.Open(filepath.Join(t.TempDir(), "unknown-rejection.db"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		repo := repository.NewQueueRepository(db)
-		for i := 0; i < 2; i++ {
-			if err := repo.SaveErrorLog(ctx, &models.ErrorLog{AppName: "app", Environment: "test", Level: "ERROR", Message: "failure"}); err != nil {
-				t.Fatal(err)
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			repo, count := openRepo(t, "unknown-rejection.db")
+			saveError(t, repo, nil)
+			saveError(t, repo, nil)
+			central := &requeststest.Central{Errors: func(*ingestv1.IngestErrorsRequest) (*ingestv1.IngestErrorsResponse, error) { return nil, rejection }}
+			s := New(repo, requeststest.Start(t, central, "test-key"))
+			if err := s.SendPendingErrorLogs(ctx); err == nil {
+				t.Fatal("unidentified rejection accepted")
 			}
-		}
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(400)
-			_, _ = w.Write([]byte(body))
-		}))
-		client, err := requests.NewClient(server.URL, "test-key")
-		if err != nil {
-			t.Fatal(err)
-		}
-		s := New(repo, client)
-		if err := s.SendPendingErrorLogs(ctx); err == nil {
-			t.Fatal("unidentified rejection accepted")
-		}
-		if !errors.Is(s.deliveryGate(), errPaused) {
-			t.Fatal("unidentified rejection must pause the incompatible delivery contract")
-		}
-		var count int
-		if err := db.QueryRow("SELECT COUNT(*) FROM delivery_status WHERE sent_at IS NULL AND quarantine_reason IS NULL").Scan(&count); err != nil || count != 2 {
-			t.Fatal("batch was quarantined or acknowledged", count, err)
-		}
-		server.Close()
-		_ = db.Close()
+			if !errors.Is(s.deliveryGate(), errPaused) {
+				t.Fatal("unidentified rejection must pause the incompatible delivery contract")
+			}
+			if n := count("SELECT COUNT(*) FROM delivery_status WHERE sent_at IS NULL AND quarantine_reason IS NULL"); n != 2 {
+				t.Fatal("batch was quarantined or acknowledged", n)
+			}
+		})
 	}
 }

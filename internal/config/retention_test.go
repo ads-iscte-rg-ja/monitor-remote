@@ -6,7 +6,7 @@ import (
 )
 
 func TestCleanupConfiguration(t *testing.T) {
-	t.Setenv("CENTRAL_URL", "https://central.example")
+	t.Setenv("CENTRAL_GRPC_URL", "https://central.example")
 	t.Setenv("HOST_API_KEY", "test-only-key")
 	t.Setenv("COLLECTION_INTERVAL", "30s")
 	t.Setenv("STATS_POST_INTERVAL", "30s")

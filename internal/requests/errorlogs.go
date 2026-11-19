@@ -2,37 +2,32 @@ package requests
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
+
+	ingestv1 "github.com/ads-iscte-rg-ja/monitor-api/gen/go/monitor/ingest/v1"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"monitor-remote/internal/models"
 	"monitor-remote/internal/validation"
 )
 
-type errorLogPayload struct {
-	ID          int64           `json:"id"`
-	AppName     string          `json:"app_name"`
-	Environment string          `json:"environment"`
-	Level       string          `json:"level"`
-	Message     string          `json:"message"`
-	StackTrace  *string         `json:"stack_trace,omitempty"`
-	Metadata    json.RawMessage `json:"metadata,omitempty"`
-	CreatedAt   time.Time       `json:"created_at"`
+var logLevels = map[string]ingestv1.LogLevel{
+	"INFO":     ingestv1.LogLevel_LOG_LEVEL_INFO,
+	"WARN":     ingestv1.LogLevel_LOG_LEVEL_WARN,
+	"ERROR":    ingestv1.LogLevel_LOG_LEVEL_ERROR,
+	"CRITICAL": ingestv1.LogLevel_LOG_LEVEL_CRITICAL,
+	"PANIC":    ingestv1.LogLevel_LOG_LEVEL_PANIC,
 }
 
-type errorLogsPayload struct {
-	Errors []errorLogPayload `json:"errors"`
-}
-
-func (c *Client) SendErrorLogs(
-	ctx context.Context,
-	logs []models.ErrorLog,
-) error {
+// SendErrorLogs delivers one batch and succeeds only if central accounted for
+// every submitted source ID exactly once.
+func (c *Client) SendErrorLogs(ctx context.Context, logs []models.ErrorLog) error {
 	if len(logs) == 0 || len(logs) > MaxBatchRecords {
 		return fmt.Errorf("error batch must contain 1 to %d records", MaxBatchRecords)
 	}
-	payload := errorLogsPayload{Errors: make([]errorLogPayload, 0, len(logs))}
+	req := &ingestv1.IngestErrorsRequest{Errors: make([]*ingestv1.ErrorLog, 0, len(logs))}
 	want := make(map[int64]bool, len(logs))
 	for _, entry := range logs {
 		if err := validation.ErrorLog(entry, time.Now().UTC()); err != nil {
@@ -42,27 +37,26 @@ func (c *Client) SendErrorLogs(
 			return fmt.Errorf("duplicate error source ID in batch")
 		}
 		want[entry.ID] = true
-		payload.Errors = append(payload.Errors, errorLogPayload{ID: entry.ID, AppName: entry.AppName, Environment: entry.Environment, Level: entry.Level, Message: entry.Message, StackTrace: entry.StackTrace, Metadata: entry.Metadata, CreatedAt: entry.CreatedAt.UTC()})
+		req.Errors = append(req.Errors, &ingestv1.ErrorLog{
+			SourceId:     entry.ID,
+			AppName:      entry.AppName,
+			Environment:  entry.Environment,
+			Level:        logLevels[strings.ToUpper(strings.TrimSpace(entry.Level))], // validated above
+			Message:      entry.Message,
+			StackTrace:   entry.StackTrace,
+			MetadataJson: string(entry.Metadata),
+			CreatedAt:    timestamppb.New(entry.CreatedAt.UTC()),
+		})
 	}
-
-	var ack struct {
-		Accepted   *int    `json:"accepted"`
-		Inserted   *int    `json:"inserted"`
-		Duplicates *int    `json:"duplicates"`
-		SourceIDs  []int64 `json:"source_ids"`
-	}
-	if err := c.postJSON(
-		ctx,
-		"/api/v1/ingest/errors",
-		payload,
-		&ack,
-	); err != nil {
+	resp, err := call(ctx, c, req, c.api.IngestErrors)
+	if err != nil {
 		return err
 	}
-	if ack.Accepted == nil || ack.Inserted == nil || ack.Duplicates == nil || *ack.Accepted != len(logs) || *ack.Inserted < 0 || *ack.Inserted > len(logs) || *ack.Duplicates < 0 || *ack.Duplicates > len(logs) || *ack.Inserted+*ack.Duplicates != len(logs) || len(ack.SourceIDs) != len(logs) {
+	accepted, inserted, duplicates := int(resp.GetAccepted()), int(resp.GetInserted()), int(resp.GetDuplicates())
+	if accepted != len(logs) || inserted < 0 || duplicates < 0 || inserted+duplicates != len(logs) || len(resp.GetSourceIds()) != len(logs) {
 		return fmt.Errorf("central did not acknowledge the complete error submission")
 	}
-	for _, id := range ack.SourceIDs {
+	for _, id := range resp.GetSourceIds() {
 		if !want[id] {
 			return fmt.Errorf("central acknowledgement does not match the submitted error source IDs")
 		}

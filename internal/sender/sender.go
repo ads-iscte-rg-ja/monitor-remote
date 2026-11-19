@@ -6,6 +6,8 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/grpc/codes"
+
 	"monitor-remote/internal/models"
 	"monitor-remote/internal/repository"
 	"monitor-remote/internal/requests"
@@ -134,7 +136,7 @@ func (s *Sender) deliveryGate() error {
 		return errPaused
 	}
 	if delay := time.Until(s.notBefore); delay > 0 {
-		return &requests.DeliveryError{StatusCode: 429, RetryAfter: delay}
+		return &requests.DeliveryError{Code: codes.ResourceExhausted, RetryAfter: delay}
 	}
 	return nil
 }
