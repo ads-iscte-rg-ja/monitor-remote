@@ -51,3 +51,19 @@ func TestCollectionAndDeliveryIntervalBounds(t *testing.T) {
 		})
 	}
 }
+
+func TestCentralGRPCURLIsRequiredAndSecureOutsideLoopback(t *testing.T) {
+	t.Setenv("HOST_API_KEY", "test-only-key")
+	for _, value := range []string{"", "not a url", "http://central.example:3334", "central.example:3334"} {
+		t.Setenv("CENTRAL_GRPC_URL", value)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "CENTRAL_GRPC_URL") {
+			t.Fatalf("CENTRAL_GRPC_URL=%q accepted or unclear error: %v", value, err)
+		}
+	}
+	for _, value := range []string{"https://central.example", "http://localhost:3334", "http://127.0.0.1:3334"} {
+		t.Setenv("CENTRAL_GRPC_URL", value)
+		if cfg, err := Load(); err != nil || cfg.CentralURL != value {
+			t.Fatalf("CENTRAL_GRPC_URL=%q rejected: %v", value, err)
+		}
+	}
+}
