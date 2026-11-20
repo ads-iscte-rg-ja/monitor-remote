@@ -42,3 +42,18 @@ CREATE INDEX IF NOT EXISTS idx_delivery_status_pending
 
 CREATE INDEX IF NOT EXISTS idx_delivery_status_sent
     ON delivery_status(sent_at, id) WHERE sent_at IS NOT NULL;
+
+-- Buffer limit (ADR-0009): picks the oldest pending log of one level.
+CREATE INDEX IF NOT EXISTS idx_error_logs_level ON error_logs(level, id);
+
+-- Quarantined entries are rare; the hard-limit phase reads them oldest first.
+CREATE INDEX IF NOT EXISTS idx_delivery_status_quarantined
+    ON delivery_status(id) WHERE quarantine_reason IS NOT NULL;
+
+-- Records dropped by the buffer limit, per log level or 'machine_stat'. Updated in
+-- the same transaction as the deletion; counters only grow (reported by D17).
+CREATE TABLE IF NOT EXISTS buffer_drops (
+    kind TEXT PRIMARY KEY CHECK(kind IN ('INFO', 'WARN', 'ERROR', 'CRITICAL', 'PANIC', 'machine_stat')),
+    dropped INTEGER NOT NULL CHECK(dropped >= 0),
+    last_dropped_at TEXT NOT NULL
+);

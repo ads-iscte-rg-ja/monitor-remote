@@ -32,6 +32,9 @@ DISK_PATH=/
 SENT_RETENTION_DAYS=7
 CLEANUP_INTERVAL=1h
 CLEANUP_BATCH_SIZE=1000
+BUFFER_MAX_MB=512
+BUFFER_HARD_MAX_MB=1024
+BUFFER_CHECK_INTERVAL=10s
 ```
 
 `CENTRAL_GRPC_URL` is central's gRPC ingestion endpoint (`GRPC_PORT`, not the
@@ -78,7 +81,35 @@ codes live in [monitor-api](https://github.com/ads-iscte-rg-ja/monitor-api).
   from the contract's stable rejection code, never from central's message text.
 - Delivered records are cleaned after seven days by default. Set
   `SENT_RETENTION_DAYS=0` to disable cleanup. Pending and quarantined records are
-  never automatically deleted.
+  never deleted by cleanup; only the buffer limit below can remove them.
+
+## Buffer limit
+
+The buffer has a size limit so that a burst of logs while central is down cannot
+fill the host's disk ([ADR-0009](https://github.com/ads-iscte-rg-ja/monitor-platform/blob/main/docs/adr/0009-buffer-do-remote-com-limite.md)).
+The size is the space in use inside the SQLite file (pages minus free pages).
+
+| Setting | Default | Accepted range |
+| --- | --- | --- |
+| `BUFFER_MAX_MB` | 512 | 1–1048576 MiB |
+| `BUFFER_HARD_MAX_MB` | twice `BUFFER_MAX_MB` | ≥ `BUFFER_MAX_MB` |
+| `BUFFER_CHECK_INTERVAL` | 10s | 1s–5m |
+
+At start and after each interval the agent checks the size. Records are always
+removed oldest first, in short transactions of 500 records:
+
+1. Above `BUFFER_MAX_MB`, down to 90 % of it: delivered records (not a loss),
+   then pending **INFO**, **WARN** and machine statistics.
+2. Only if still above `BUFFER_HARD_MAX_MB`, down to 90 % of it: quarantined
+   records, then **ERROR**, **CRITICAL** and **PANIC**. The agent then writes a
+   CRITICAL log (`app_name = monitor-remote`) with what it dropped; it reaches
+   central like any log and triggers `error_level` alert rules.
+
+Every dropped record is counted by level (or `machine_stat`) in the
+`buffer_drops` table, in the same transaction that removes it, and each cycle
+that drops records writes a line to the agent log. Between two checks the buffer
+can exceed the limit by what applications write in one interval. The SQLite
+file does not shrink; freed space is reused.
 
 ## Connect applications
 
