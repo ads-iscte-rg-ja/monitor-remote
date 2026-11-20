@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"monitor-remote/internal/bufferlimit"
 	"monitor-remote/internal/collect"
 	"monitor-remote/internal/config"
 	"monitor-remote/internal/database"
@@ -69,10 +70,12 @@ func main() {
 	defer stop()
 
 	logger.Printf(
-		"agent started; collection interval=%s; stats post interval=%s; error post interval=%s",
+		"agent started; collection interval=%s; stats post interval=%s; error post interval=%s; buffer limits=%d/%d MiB",
 		cfg.CollectionInterval,
 		cfg.StatsPostInterval,
 		cfg.ErrorPostInterval,
+		cfg.BufferMaxBytes>>20,
+		cfg.BufferHardMaxBytes>>20,
 	)
 
 	collectAndStore := func() {
@@ -117,6 +120,10 @@ func main() {
 			deliverySender.RunErrorLogs(ctx, cfg.ErrorPostInterval, func(err error) { logger.Printf("error delivery: %v", err) })
 		},
 		func() { runCleanup(ctx, cfg, queueRepository, logger) },
+		func() {
+			limits := repository.BufferLimits{Soft: cfg.BufferMaxBytes, Hard: cfg.BufferHardMaxBytes}
+			bufferlimit.Run(ctx, queueRepository, limits, cfg.BufferCheckInterval, logger.Printf)
+		},
 	} {
 		workers.Add(1)
 		go func() { defer workers.Done(); run() }()

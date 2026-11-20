@@ -28,6 +28,10 @@ type Config struct {
 	SentRetentionDays  int
 	CleanupInterval    time.Duration
 	CleanupBatchSize   int
+	// Buffer limits in bytes and the enforcement interval (ADR-0009).
+	BufferMaxBytes      int64
+	BufferHardMaxBytes  int64
+	BufferCheckInterval time.Duration
 }
 
 func Load() (*Config, error) {
@@ -102,20 +106,7 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	retentionDays, err := loadInt("SENT_RETENTION_DAYS", 7, 0, 36500)
-	if err != nil {
-		return nil, err
-	}
-	cleanupInterval, err := loadBoundedDuration("CLEANUP_INTERVAL", time.Hour, time.Minute, 24*time.Hour)
-	if err != nil {
-		return nil, err
-	}
-	cleanupBatch, err := loadInt("CLEANUP_BATCH_SIZE", 1000, 1, 10000)
-	if err != nil {
-		return nil, err
-	}
-
-	return &Config{
+	cfg := &Config{
 		CentralURL:         centralURL,
 		HostAPIKey:         apiKey,
 		SQLitePath:         DatabasePath(),
@@ -123,10 +114,11 @@ func Load() (*Config, error) {
 		StatsPostInterval:  statsPostInterval,
 		ErrorPostInterval:  errorPostInterval,
 		DiskPath:           loadDiskPath(),
-		SentRetentionDays:  retentionDays,
-		CleanupInterval:    cleanupInterval,
-		CleanupBatchSize:   cleanupBatch,
-	}, nil
+	}
+	if err := loadStorage(cfg); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }
 
 func DatabasePath() string {
