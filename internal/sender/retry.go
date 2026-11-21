@@ -10,7 +10,7 @@ import (
 )
 
 func (s *Sender) RunMachineStats(ctx context.Context, interval time.Duration, report func(error)) {
-	s.run(ctx, interval, s.SendPendingMachineStats, report)
+	s.run(ctx, interval, func(ctx context.Context) error { return s.deliverMachineStats(ctx, interval) }, report)
 }
 
 func (s *Sender) RunErrorLogs(ctx context.Context, interval time.Duration, report func(error)) {

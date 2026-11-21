@@ -87,3 +87,95 @@ func TestStatisticsAreSentWithoutSnapshotWhenItFails(t *testing.T) {
 		t.Fatalf("statistics must be sent without a snapshot: sent=%v buffer=%v", sent, got)
 	}
 }
+
+// MN1 end to end found that a statistics cycle with nothing pending sent no
+// snapshot, leaving central one cycle behind (ADR-0012). Such a cycle now sends
+// the next stored statistic at once, with a snapshot that sees the quarantine.
+func TestIdleStatisticsCycleSendsTheNextStatisticAtOnce(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	repo, _ := openRepo(t, "idle.db")
+	seen := make(chan *ingestv1.BufferStatus, 4)
+	central := &requeststest.Central{Stats: func(r *ingestv1.IngestStatsRequest) (*ingestv1.IngestStatsResponse, error) {
+		seen <- r.GetBuffer()
+		return requeststest.AckStats(r, 7), nil
+	}}
+	s := New(repo, requeststest.Start(t, central, "test-key"))
+
+	done := make(chan error, 1)
+	go func() { done <- s.deliverMachineStats(ctx, time.Hour) }()
+	saveError(t, repo, nil)
+	pending, err := repo.ListPendingErrorLogs(ctx, 1)
+	if err != nil || len(pending) != 1 {
+		t.Fatal(pending, err)
+	}
+	if err := repo.Quarantine(ctx, pending[0].DeliveryID, "invalid record"); err != nil {
+		t.Fatal(err)
+	}
+	saveStat(t, repo)
+	s.NotifyStatsQueued()
+
+	// Well before the one-hour interval: the cycle does not wait for its timer.
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case status := <-seen:
+		if status.GetQuarantined() != 1 {
+			t.Fatalf("snapshot %v", status)
+		}
+	default:
+		t.Fatal("the statistic was not sent in this cycle")
+	}
+}
+
+func TestIdleStatisticsCycleWaitsAtMostOneInterval(t *testing.T) {
+	repo, _ := openRepo(t, "quiet.db")
+	requests := 0
+	central := &requeststest.Central{Stats: func(r *ingestv1.IngestStatsRequest) (*ingestv1.IngestStatsResponse, error) {
+		requests++
+		return requeststest.AckStats(r, 7), nil
+	}}
+	s := New(repo, requeststest.Start(t, central, "test-key"))
+	if err := s.deliverMachineStats(context.Background(), 10*time.Millisecond); err != nil || requests != 0 {
+		t.Fatalf("err=%v requests=%d", err, requests)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.deliverMachineStats(ctx, time.Hour); err == nil {
+		t.Fatal("a cancelled cycle must report the context error")
+	}
+	s.NotifyStatsQueued()
+	s.NotifyStatsQueued() // never blocks when a token is already waiting
+}
+
+func TestStatisticsWorkerDrainsTheNotificationAndStopsWithItsContext(t *testing.T) {
+	repo, _ := openRepo(t, "worker.db")
+	sent := make(chan struct{}, 8)
+	central := &requeststest.Central{Stats: func(r *ingestv1.IngestStatsRequest) (*ingestv1.IngestStatsResponse, error) {
+		sent <- struct{}{}
+		return requeststest.AckStats(r, 7), nil
+	}}
+	s := New(repo, requeststest.Start(t, central, "test-key"))
+	saveStat(t, repo)
+	s.NotifyStatsQueued() // the cycle sends this statistic and consumes the token
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { s.RunMachineStats(ctx, time.Hour, func(err error) { t.Error(err) }); close(done) }()
+	<-sent
+	cancel()
+	<-done
+	if len(s.statsQueued) != 0 {
+		t.Fatal("the notification for a statistic already sent must not trigger another cycle")
+	}
+
+	// An idle cycle (empty buffer) cancelled while it waits for the next statistic.
+	empty, _ := openRepo(t, "empty.db")
+	waiting, stop := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer stop()
+	if err := New(empty, requeststest.Start(t, central, "test-key")).deliverMachineStats(waiting, time.Hour); err == nil {
+		t.Fatal("a cycle cancelled while waiting must report the context error")
+	}
+}
