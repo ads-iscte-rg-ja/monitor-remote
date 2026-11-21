@@ -9,8 +9,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"net"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +19,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
+
+	"monitor-remote/internal/validation"
 )
 
 // MaxBatchRecords is the contract's maximum number of records per request.
@@ -94,29 +94,14 @@ func (c *Client) Close() error {
 }
 
 func parseTarget(rawURL string) (string, credentials.TransportCredentials, error) {
-	u, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Trim(u.Path, "/") != "" {
-		return "", nil, fmt.Errorf("CENTRAL_GRPC_URL must be https://host[:port] (or http:// on loopback) without credentials, path, query, or fragment")
+	endpoint, err := validation.CentralURL(rawURL)
+	if err != nil {
+		return "", nil, err
 	}
-	port := u.Port()
-	switch u.Scheme {
-	case "https":
-		if port == "" {
-			port = "443"
-		}
-		return net.JoinHostPort(u.Hostname(), port), credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12}), nil
-	case "http":
-		ip := net.ParseIP(u.Hostname())
-		if !strings.EqualFold(u.Hostname(), "localhost") && (ip == nil || !ip.IsLoopback()) {
-			return "", nil, fmt.Errorf("CENTRAL_GRPC_URL requires HTTPS outside loopback")
-		}
-		if port == "" {
-			port = "80"
-		}
-		return net.JoinHostPort(u.Hostname(), port), insecure.NewCredentials(), nil
-	default:
-		return "", nil, fmt.Errorf("CENTRAL_GRPC_URL must use https:// (or http:// on loopback)")
+	if endpoint.TLS {
+		return endpoint.Address, credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12}), nil
 	}
+	return endpoint.Address, insecure.NewCredentials(), nil
 }
 
 // call runs one RPC with the host credential and the contract's size limit.

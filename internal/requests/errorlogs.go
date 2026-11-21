@@ -13,12 +13,14 @@ import (
 	"monitor-remote/internal/validation"
 )
 
+// logLevels translates validation.Levels to the contract (ADR-0015); a test
+// checks that every level, and only those, has a translation.
 var logLevels = map[string]ingestv1.LogLevel{
-	"INFO":     ingestv1.LogLevel_LOG_LEVEL_INFO,
-	"WARN":     ingestv1.LogLevel_LOG_LEVEL_WARN,
-	"ERROR":    ingestv1.LogLevel_LOG_LEVEL_ERROR,
-	"CRITICAL": ingestv1.LogLevel_LOG_LEVEL_CRITICAL,
-	"PANIC":    ingestv1.LogLevel_LOG_LEVEL_PANIC,
+	validation.LevelInfo:     ingestv1.LogLevel_LOG_LEVEL_INFO,
+	validation.LevelWarn:     ingestv1.LogLevel_LOG_LEVEL_WARN,
+	validation.LevelError:    ingestv1.LogLevel_LOG_LEVEL_ERROR,
+	validation.LevelCritical: ingestv1.LogLevel_LOG_LEVEL_CRITICAL,
+	validation.LevelPanic:    ingestv1.LogLevel_LOG_LEVEL_PANIC,
 }
 
 // SendErrorLogs delivers one batch and succeeds only if central accounted for

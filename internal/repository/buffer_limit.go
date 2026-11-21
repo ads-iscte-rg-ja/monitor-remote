@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"monitor-remote/internal/models"
+	"monitor-remote/internal/validation"
 )
 
 // BufferLimits bounds the SQLite buffer in bytes (ADR-0009). Above Soft, only
@@ -67,15 +68,15 @@ type shedPhase struct {
 var (
 	softPhases = []shedPhase{
 		{query: selectDelivered},
-		{query: selectPendingLevel, args: []any{"INFO"}},
-		{query: selectPendingLevel, args: []any{"WARN"}},
+		{query: selectPendingLevel, args: []any{validation.LevelInfo}},
+		{query: selectPendingLevel, args: []any{validation.LevelWarn}},
 		{query: selectPendingStats},
 	}
 	hardPhases = []shedPhase{
 		{query: selectQuarantined},
-		{query: selectPendingLevel, args: []any{"ERROR"}},
-		{query: selectPendingLevel, args: []any{"CRITICAL"}},
-		{query: selectPendingLevel, args: []any{"PANIC"}},
+		{query: selectPendingLevel, args: []any{validation.LevelError}},
+		{query: selectPendingLevel, args: []any{validation.LevelCritical}},
+		{query: selectPendingLevel, args: []any{validation.LevelPanic}},
 	}
 )
 
@@ -261,7 +262,7 @@ func (r *QueueRepository) recordHardLimitEvent(ctx context.Context, limits Buffe
 	event := &models.ErrorLog{
 		AppName:     BufferEventApp,
 		Environment: "agent",
-		Level:       "CRITICAL",
+		Level:       validation.LevelCritical,
 		Message: fmt.Sprintf("buffer hard limit of %d MiB reached; dropped %s",
 			limits.Hard>>20, FormatDrops(result.Dropped)),
 		Metadata:  metadata,

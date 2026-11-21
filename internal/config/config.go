@@ -2,12 +2,13 @@ package config
 
 import (
 	"fmt"
-	"net/url"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
+
+	"monitor-remote/internal/validation"
 )
 
 const (
@@ -54,21 +55,9 @@ func Load() (*Config, error) {
 		)
 	}
 
-	parsedURL, err := url.Parse(centralURL)
-	if err != nil ||
-		parsedURL.Scheme == "" ||
-		parsedURL.Host == "" {
-		return nil, fmt.Errorf(
-			"CENTRAL_GRPC_URL must be a valid URL",
-		)
-	}
-
-	if parsedURL.Scheme != "https" &&
-		!(parsedURL.Scheme == "http" &&
-			isLocalHost(parsedURL.Hostname())) {
-		return nil, fmt.Errorf(
-			"CENTRAL_GRPC_URL must use HTTPS outside localhost",
-		)
+	// The same rule as the gRPC client (ADR-0015).
+	if _, err := validation.CentralURL(centralURL); err != nil {
+		return nil, err
 	}
 
 	apiKey := strings.TrimSpace(
@@ -151,15 +140,6 @@ func loadBoundedDuration(name string, defaultValue, minimum, maximum time.Durati
 		return 0, fmt.Errorf("%s must be a duration between %s and %s", name, minimum, maximum)
 	}
 	return duration, nil
-}
-
-func isLocalHost(host string) bool {
-	switch strings.ToLower(host) {
-	case "localhost", "127.0.0.1", "::1":
-		return true
-	default:
-		return false
-	}
 }
 
 func loadDiskPath() string {

@@ -63,9 +63,7 @@ func ErrorLog(e models.ErrorLog, now time.Time) error {
 	if len(e.Metadata) > 0 && !json.Valid(e.Metadata) {
 		return Invalid("metadata is not valid JSON")
 	}
-	switch strings.ToUpper(strings.TrimSpace(e.Level)) {
-	case "INFO", "WARN", "ERROR", "CRITICAL", "PANIC":
-	default:
+	if !ValidLevel(strings.ToUpper(strings.TrimSpace(e.Level))) {
 		return Invalid("unsupported error severity")
 	}
 	return timestamp(e.CreatedAt, now)
