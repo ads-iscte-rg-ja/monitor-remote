@@ -139,5 +139,6 @@ fresh registered host identity because central deduplicates its source IDs.
 Central owns availability checks. Configure an optional application health URL
 there, or a last-contact timeout long enough for your reporting intervals.
 
-Recent changes await executable verification; see the
-[implementation checklist](../IMPLEMENTATION_CHECKLIST.md).
+The end-to-end tests (central unavailable, invalid or revoked key, quarantine)
+live in [monitor-platform/e2e](https://github.com/ads-iscte-rg-ja/monitor-platform/tree/main/e2e)
+and run nightly.

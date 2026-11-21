@@ -104,6 +104,7 @@ func main() {
 			"machine status stored locally: id=%d",
 			stat.ID,
 		)
+		deliverySender.NotifyStatsQueued()
 	}
 
 	// Recolhe uma medição quando o agente inicia.
