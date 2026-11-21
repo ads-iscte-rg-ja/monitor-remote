@@ -32,9 +32,14 @@ type Config struct {
 	BufferMaxBytes      int64
 	BufferHardMaxBytes  int64
 	BufferCheckInterval time.Duration
+	// APIKeyFromEnvironment: HOST_API_KEY came from the process environment,
+	// not from .env, so SIGHUP keeps it (ADR-0011).
+	APIKeyFromEnvironment bool
 }
 
 func Load() (*Config, error) {
+	// A key set in the process environment wins over .env, now and on SIGHUP.
+	_, keyFromEnvironment := os.LookupEnv("HOST_API_KEY")
 	// A ausência de .env não é um erro: em produção poderão
 	// ser utilizadas variáveis definidas diretamente no sistema.
 	_ = godotenv.Load()
@@ -114,6 +119,8 @@ func Load() (*Config, error) {
 		StatsPostInterval:  statsPostInterval,
 		ErrorPostInterval:  errorPostInterval,
 		DiskPath:           loadDiskPath(),
+
+		APIKeyFromEnvironment: keyFromEnvironment,
 	}
 	if err := loadStorage(cfg); err != nil {
 		return nil, err
@@ -164,4 +171,25 @@ func loadDiskPath() string {
 	}
 
 	return path
+}
+
+// EnvFile is the configuration file read at start and again on SIGHUP.
+const EnvFile = ".env"
+
+// ReloadAPIKey reads HOST_API_KEY again for SIGHUP (ADR-0011), with the same
+// precedence as at start: a key from the process environment wins over .env.
+// Only the key is reloadable; other settings need a restart.
+func ReloadAPIKey(envFile string, fromEnvironment bool) (string, error) {
+	if fromEnvironment {
+		return strings.TrimSpace(os.Getenv("HOST_API_KEY")), nil
+	}
+	values, err := godotenv.Read(envFile)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", envFile, err)
+	}
+	key := strings.TrimSpace(values["HOST_API_KEY"])
+	if key == "" {
+		return "", fmt.Errorf("HOST_API_KEY is missing from %s", envFile)
+	}
+	return key, nil
 }
