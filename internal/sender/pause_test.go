@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -275,6 +276,14 @@ func TestRunLoopSurvivesAPause(t *testing.T) {
 	central := newSwitchableCentral(codes.Unauthenticated)
 	s := New(repo, requeststest.Start(t, central.Central, "key"))
 	s.probeInterval = 50 * time.Millisecond
+	// The resume is logged after the probe's record is marked sent: waiting for
+	// it needs no polling and no sleep (TE3, ADR-0014).
+	resumed := make(chan struct{}, 1)
+	s.SetLogger(func(format string, _ ...any) {
+		if strings.HasPrefix(format, "delivery resumed") {
+			resumed <- struct{}{}
+		}
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	done := make(chan struct{})
@@ -282,14 +291,16 @@ func TestRunLoopSurvivesAPause(t *testing.T) {
 		defer close(done)
 		s.RunErrorLogs(ctx, 10*time.Millisecond, func(error) { central.accept.Store(true) })
 	}()
-	for count("SELECT COUNT(*) FROM delivery_status WHERE sent_at IS NULL") != 0 {
-		if ctx.Err() != nil {
-			t.Fatal("delivery did not resume after the pause")
-		}
-		time.Sleep(10 * time.Millisecond)
+	select {
+	case <-resumed:
+	case <-ctx.Done():
+		t.Fatal("delivery did not resume after the pause")
 	}
 	cancel()
 	<-done
+	if n := count("SELECT COUNT(*) FROM delivery_status WHERE sent_at IS NULL"); n != 0 {
+		t.Fatalf("%d records still pending after the resume", n)
+	}
 }
 
 func TestReloadOnSignal(t *testing.T) {
