@@ -61,6 +61,7 @@ func main() {
 		queueRepository,
 		requestClient,
 	)
+	deliverySender.SetLogger(logger.Printf)
 
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
@@ -120,6 +121,7 @@ func main() {
 			deliverySender.RunErrorLogs(ctx, cfg.ErrorPostInterval, func(err error) { logger.Printf("error delivery: %v", err) })
 		},
 		func() { runCleanup(ctx, cfg, queueRepository, logger) },
+		func() { reloadOnSIGHUP(ctx, cfg, deliverySender) },
 		func() {
 			limits := repository.BufferLimits{Soft: cfg.BufferMaxBytes, Hard: cfg.BufferHardMaxBytes}
 			bufferlimit.Run(ctx, queueRepository, limits, cfg.BufferCheckInterval, logger.Printf)
@@ -156,6 +158,17 @@ func runCleanup(ctx context.Context, cfg *config.Config, repo *repository.QueueR
 			}
 		}
 	}
+}
+
+// reloadOnSIGHUP reloads the host key and probes a paused delivery at once
+// (ADR-0011). Without this handler, SIGHUP would end the agent.
+func reloadOnSIGHUP(ctx context.Context, cfg *config.Config, s *sender.Sender) {
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+	s.ReloadOnSignal(ctx, hup, func() (string, error) {
+		return config.ReloadAPIKey(config.EnvFile, cfg.APIKeyFromEnvironment)
+	})
 }
 
 // Wait after each cycle instead of accumulating ticks while a request is slow.

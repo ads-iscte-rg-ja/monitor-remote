@@ -15,6 +15,11 @@ import (
 // SendMachineStats delivers one batch and succeeds only if central acknowledged
 // every submitted source ID, once, for a single host.
 func (c *Client) SendMachineStats(ctx context.Context, stats []models.MachineStat) error {
+	return c.SendMachineStatsWithBuffer(ctx, stats, nil)
+}
+
+// SendMachineStatsWithBuffer also reports the buffer snapshot, if any (ADR-0010).
+func (c *Client) SendMachineStatsWithBuffer(ctx context.Context, stats []models.MachineStat, buffer *models.BufferStatus) error {
 	if len(stats) == 0 || len(stats) > MaxBatchRecords {
 		return fmt.Errorf("statistics batch must contain 1 to %d records", MaxBatchRecords)
 	}
@@ -38,6 +43,7 @@ func (c *Client) SendMachineStats(ctx context.Context, stats []models.MachineSta
 			CollectedAt: timestamppb.New(stat.CollectedAt.UTC()),
 		})
 	}
+	req.Buffer = bufferStatus(buffer)
 	resp, err := call(ctx, c, req, c.api.IngestStats)
 	if err != nil {
 		return err
@@ -57,4 +63,19 @@ func (c *Client) SendMachineStats(ctx context.Context, stats []models.MachineSta
 		delete(want, ack.GetSourceId())
 	}
 	return nil
+}
+
+func bufferStatus(status *models.BufferStatus) *ingestv1.BufferStatus {
+	if status == nil {
+		return nil
+	}
+	return &ingestv1.BufferStatus{
+		ObservedAt:              timestamppb.New(status.ObservedAt.UTC()),
+		Pending:                 status.Pending,
+		Quarantined:             status.Quarantined,
+		OldestPendingAgeSeconds: status.OldestPendingAgeSeconds,
+		DeliveryPaused:          status.DeliveryPaused,
+		SizeBytes:               status.SizeBytes,
+		DroppedByKind:           status.DroppedByKind,
+	}
 }

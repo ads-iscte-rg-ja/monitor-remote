@@ -14,7 +14,8 @@ import (
 )
 
 // DeliveryError describes a delivery-wide problem, never a reason to quarantine
-// an otherwise valid record. Paused delivery is resumed by fixing config/restarting.
+// an otherwise valid record. A paused delivery resumes after a successful probe
+// (every 5 minutes, or at once after SIGHUP reloads the key; ADR-0011).
 type DeliveryError struct {
 	Code       codes.Code
 	Pause      bool
@@ -23,7 +24,7 @@ type DeliveryError struct {
 
 func (e *DeliveryError) Error() string {
 	if e.Pause {
-		return fmt.Sprintf("central returned %s; delivery paused until restart", e.Code)
+		return fmt.Sprintf("central returned %s; delivery paused until a probe succeeds", e.Code)
 	}
 	return fmt.Sprintf("central returned %s", e.Code)
 }

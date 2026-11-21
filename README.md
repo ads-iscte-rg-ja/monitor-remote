@@ -75,8 +75,22 @@ split to respect the contract's 1 MiB message limit. The contract and its error
 codes live in [monitor-api](https://github.com/ads-iscte-rg-ja/monitor-api).
 
 - Valid acknowledgements mark records delivered; failures leave them pending.
+- Each statistics cycle reports a snapshot of the buffer with its batches
+  ([ADR-0010](https://github.com/ads-iscte-rg-ja/monitor-platform/blob/main/docs/adr/0010-estado-do-buffer-e-health-ready.md)):
+  pending and quarantined records, age of the oldest pending one, paused
+  delivery, size and drops by level. Central shows it and can alert on
+  quarantined records. If the snapshot cannot be taken, statistics go without it.
 - Temporary failures retry with backoff and respect central's `RetryInfo`.
-- Credential/configuration failures pause delivery until corrected and restarted.
+- Credential and contract failures (`UNAUTHENTICATED`, `PERMISSION_DENIED`, a
+  rejection that names no record) pause delivery without stopping the agent
+  ([ADR-0011](https://github.com/ads-iscte-rg-ja/monitor-platform/blob/main/docs/adr/0011-remote-retoma-sem-reinicio.md)).
+  While paused, one probe of a single record runs every 5 minutes; when central
+  accepts it (or validates and rejects that record), delivery resumes at once.
+  Pause and resume appear in the agent log.
+- After regenerating the host key in central, update `HOST_API_KEY` in `.env`
+  and send `SIGHUP` (`kill -HUP <pid>`): the agent reloads the key and probes at
+  once. A key set in the process environment keeps precedence over `.env`. Other
+  settings still need a restart.
 - Invalid individual records retain their payload and a quarantine reason taken
   from the contract's stable rejection code, never from central's message text.
 - Delivered records are cleaned after seven days by default. Set

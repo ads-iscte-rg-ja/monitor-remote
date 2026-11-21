@@ -1,5 +1,5 @@
-github.com/ads-iscte-rg-ja/monitor-api v1.0.0 h1:avn6mQ97W52NRYQQoh0+w5gHeRqLPC3IgpuXIHS57l4=
-github.com/ads-iscte-rg-ja/monitor-api v1.0.0/go.mod h1:EOcWQVt+ZCMa6OnhwPAd6i1mSzMSHETt/ryrpZJiQ2M=
+github.com/ads-iscte-rg-ja/monitor-api v1.1.0 h1:uXLYFw/48W493YTs1oaetotW3cZ6HJ8CQPTlCb1oW4E=
+github.com/ads-iscte-rg-ja/monitor-api v1.1.0/go.mod h1:EOcWQVt+ZCMa6OnhwPAd6i1mSzMSHETt/ryrpZJiQ2M=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/ebitengine/purego v0.10.2 h1:W809HbnvzAxgdm+aOvlSekrM16wGCdT/e76+9tS7gzE=

@@ -6,8 +6,6 @@ import (
 	"sync"
 	"time"
 
-	"google.golang.org/grpc/codes"
-
 	"monitor-remote/internal/models"
 	"monitor-remote/internal/repository"
 	"monitor-remote/internal/requests"
@@ -18,9 +16,19 @@ type Sender struct {
 	repository *repository.QueueRepository
 	client     *requests.Client
 	batchLimit int
-	mu         sync.Mutex
-	paused     bool
-	notBefore  time.Time
+
+	// Delivery state shared by both categories (ADR-0011). now and
+	// probeInterval are injectable for tests; zero values mean time.Now and
+	// DefaultProbeInterval.
+	mu            sync.Mutex
+	now           func() time.Time
+	probeInterval time.Duration
+	paused        bool
+	probing       bool
+	probeAt       time.Time
+	notBefore     time.Time
+	wake          chan struct{}
+	logf          func(string, ...any)
 }
 
 func New(repository *repository.QueueRepository, client *requests.Client) *Sender {
@@ -34,15 +42,22 @@ func (s *Sender) SendPendingMachineStats(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	send := s.statsSender(ctx)
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		stats, err := s.repository.ListPendingMachineStatsThrough(ctx, s.batchLimit, cutoff)
+		step, err := s.admit()
 		if err != nil {
 			return err
 		}
+		stats, err := s.repository.ListPendingMachineStatsThrough(ctx, step.limit, cutoff)
+		if err != nil {
+			s.endStep(step, true)
+			return err
+		}
 		if len(stats) == 0 {
+			s.endStep(step, true)
 			return nil
 		}
 		batch := make([]pendingDelivery[models.MachineStat], 0, len(stats))
@@ -59,7 +74,7 @@ func (s *Sender) SendPendingMachineStats(ctx context.Context) error {
 			}
 			batch = append(batch, pendingDelivery[models.MachineStat]{deliveryID: pending.DeliveryID, sourceID: pending.Stat.ID, record: pending.Stat})
 		}
-		if err := deliverBatch(ctx, s, batch, s.client.SendMachineStats); err != nil {
+		if err := deliverStep(ctx, s, step, batch, send); err != nil {
 			return err
 		}
 	}
@@ -74,11 +89,17 @@ func (s *Sender) SendPendingErrorLogs(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		logs, err := s.repository.ListPendingErrorLogsThrough(ctx, s.batchLimit, cutoff)
+		step, err := s.admit()
 		if err != nil {
 			return err
 		}
+		logs, err := s.repository.ListPendingErrorLogsThrough(ctx, step.limit, cutoff)
+		if err != nil {
+			s.endStep(step, true)
+			return err
+		}
 		if len(logs) == 0 {
+			s.endStep(step, true)
 			return nil
 		}
 		batch := make([]pendingDelivery[models.ErrorLog], 0, len(logs))
@@ -95,9 +116,28 @@ func (s *Sender) SendPendingErrorLogs(ctx context.Context) error {
 			}
 			batch = append(batch, pendingDelivery[models.ErrorLog]{deliveryID: pending.DeliveryID, sourceID: pending.ErrorLog.ID, record: pending.ErrorLog})
 		}
-		if err := deliverBatch(ctx, s, batch, s.client.SendErrorLogs); err != nil {
+		if err := deliverStep(ctx, s, step, batch, s.client.SendErrorLogs); err != nil {
 			return err
 		}
+	}
+}
+
+// statsSender sends the cycle's statistics with one buffer snapshot, taken at
+// the start of the cycle (ADR-0010). The snapshot is accessory: if it cannot be
+// taken, the statistics are still delivered, without it.
+func (s *Sender) statsSender(ctx context.Context) func(context.Context, []models.MachineStat) error {
+	status, err := s.repository.BufferStatus(ctx, time.Now())
+	if err != nil {
+		return s.client.SendMachineStats
+	}
+	return func(ctx context.Context, stats []models.MachineStat) error {
+		// The pause is read at each send: a probe reports it, the batches after
+		// a resume in the same cycle do not (ADR-0011).
+		batchStatus := status
+		s.mu.Lock()
+		batchStatus.DeliveryPaused = s.paused
+		s.mu.Unlock()
+		return s.client.SendMachineStatsWithBuffer(ctx, stats, &batchStatus)
 	}
 }
 
@@ -109,34 +149,27 @@ func (s *Sender) quarantine(ctx context.Context, id int64, err error) error {
 	return s.repository.Quarantine(ctx, id, recordErr.Reason)
 }
 
-func (s *Sender) observeFailure(err error) {
-	var deliveryErr *requests.DeliveryError
-	if !errors.As(err, &deliveryErr) {
-		return
+// deliverStep sends one admitted step. A probe whose only record was dropped
+// locally (quarantined before sending) sent nothing, so it is given back.
+func deliverStep[T any](ctx context.Context, s *Sender, step admission, batch []pendingDelivery[T], send func(context.Context, []T) error) error {
+	if len(batch) == 0 {
+		s.endStep(step, true)
+		return nil
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if deliveryErr.Pause {
-		s.paused = true
-	}
-	if deliveryErr.RetryAfter > 0 {
-		next := time.Now().Add(deliveryErr.RetryAfter)
-		if next.After(s.notBefore) {
-			s.notBefore = next
-		}
-	}
+	err := deliverBatch(ctx, s, batch, send, step.probe)
+	s.endStep(step, false)
+	return err
 }
 
-var errPaused = errors.New("central delivery paused until configuration is corrected and remote restarts")
-
-func (s *Sender) deliveryGate() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.paused {
-		return errPaused
+// endStep closes a probe that did not resume delivery: unused, it is given back
+// at once; used, the next one stays booked.
+func (s *Sender) endStep(step admission, unused bool) {
+	if !step.probe {
+		return
 	}
-	if delay := time.Until(s.notBefore); delay > 0 {
-		return &requests.DeliveryError{Code: codes.ResourceExhausted, RetryAfter: delay}
+	if unused {
+		s.releaseProbe()
+		return
 	}
-	return nil
+	s.finishProbe()
 }

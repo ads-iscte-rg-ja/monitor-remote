@@ -251,3 +251,43 @@ func TestClientRejectsUnsafeAddresses(t *testing.T) {
 		t.Fatal("empty host key accepted")
 	}
 }
+
+func TestStatisticsCarryTheBufferSnapshot(t *testing.T) {
+	var got *ingestv1.BufferStatus
+	central := &requeststest.Central{Stats: func(r *ingestv1.IngestStatsRequest) (*ingestv1.IngestStatsResponse, error) {
+		got = r.GetBuffer()
+		return requeststest.AckStats(r, 7), nil
+	}}
+	client := requeststest.Start(t, central, "k")
+	observed := time.Now().Add(-time.Second)
+	status := &models.BufferStatus{ObservedAt: observed, Pending: 4, Quarantined: 3, OldestPendingAgeSeconds: 60,
+		DeliveryPaused: true, SizeBytes: 1024, DroppedByKind: map[string]int64{"INFO": 9}}
+	if err := client.SendMachineStatsWithBuffer(context.Background(), []models.MachineStat{validStat(42)}, status); err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || !got.GetObservedAt().AsTime().Equal(observed.UTC()) || got.GetPending() != 4 || got.GetQuarantined() != 3 ||
+		got.GetOldestPendingAgeSeconds() != 60 || !got.GetDeliveryPaused() || got.GetSizeBytes() != 1024 || got.GetDroppedByKind()["INFO"] != 9 {
+		t.Fatalf("buffer snapshot %v", got)
+	}
+	if err := client.SendMachineStats(context.Background(), []models.MachineStat{validStat(43)}); err != nil || got != nil {
+		t.Fatalf("statistics without a snapshot must not carry one: %v %v", got, err)
+	}
+}
+
+// ADR-0011: SIGHUP swaps the key used by the next requests.
+func TestAPIKeyCanBeReplaced(t *testing.T) {
+	central := &requeststest.Central{}
+	client := requeststest.Start(t, central, "old-key")
+	if err := client.SetAPIKey(" "); err == nil {
+		t.Fatal("an empty key must be refused")
+	}
+	if err := client.SetAPIKey(" new-key "); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SendMachineStats(context.Background(), []models.MachineStat{validStat(42)}); err != nil {
+		t.Fatal(err)
+	}
+	if keys := central.Keys(); len(keys) != 1 || keys[0] != "new-key" {
+		t.Fatalf("keys sent: %v", keys)
+	}
+}

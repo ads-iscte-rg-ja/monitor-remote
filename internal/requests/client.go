@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	ingestv1 "github.com/ads-iscte-rg-ja/monitor-api/gen/go/monitor/ingest/v1"
@@ -34,9 +35,29 @@ var ErrBatchBodyTooLarge = errors.New("telemetry batch exceeds the request messa
 
 // Client sends telemetry batches to central over gRPC.
 type Client struct {
-	api    ingestv1.IngestServiceClient
+	api  ingestv1.IngestServiceClient
+	conn *grpc.ClientConn
+
+	mu     sync.RWMutex
 	apiKey string
-	conn   *grpc.ClientConn
+}
+
+// SetAPIKey replaces the host key for the next requests (SIGHUP, ADR-0011).
+func (c *Client) SetAPIKey(apiKey string) error {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return fmt.Errorf("host API key is required")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.apiKey = apiKey
+	return nil
+}
+
+func (c *Client) key() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.apiKey
 }
 
 // NewClient connects to central at rawURL: https://host[:port] (TLS; the default
@@ -106,7 +127,7 @@ func call[Req proto.Message, Resp any](ctx context.Context, c *Client, req Req, 
 	}
 	ctx, cancel := context.WithTimeout(ctx, callTimeout)
 	defer cancel()
-	resp, err := rpc(metadata.AppendToOutgoingContext(ctx, ingestv1.APIKeyMetadata, c.apiKey), req)
+	resp, err := rpc(metadata.AppendToOutgoingContext(ctx, ingestv1.APIKeyMetadata, c.key()), req)
 	if err != nil {
 		return zero, classify(err)
 	}

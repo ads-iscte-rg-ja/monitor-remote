@@ -30,13 +30,23 @@ func (s *Sender) run(ctx context.Context, interval time.Duration, send func(cont
 			failures, delay = 0, interval
 			continue
 		}
+		if errors.Is(err, errPaused) {
+			// Not a new failure: wait sleeps until the next probe (ADR-0011).
+			delay = 0
+			continue
+		}
 		if report != nil {
 			report(err)
 		}
+		var deliveryErr *requests.DeliveryError
+		if errors.As(err, &deliveryErr) && deliveryErr.Pause {
+			// A pause is not retried with backoff: wait sleeps until the probe.
+			failures, delay = 0, 0
+			continue
+		}
 		failures = min(failures+1, 7)
 		delay = retryDelay(failures)
-		var deliveryErr *requests.DeliveryError
-		if errors.As(err, &deliveryErr) && deliveryErr.RetryAfter > delay {
+		if deliveryErr != nil && deliveryErr.RetryAfter > delay {
 			delay = deliveryErr.RetryAfter
 		}
 	}
@@ -47,37 +57,4 @@ func retryDelay(failures int) time.Duration {
 	// scheduling jitter, not credential generation.
 	base := min(5*time.Second*time.Duration(1<<min(max(failures-1, 0), 6)), 5*time.Minute)
 	return min(base*4/5+time.Duration(rand.Int64N(int64(base*2/5)+1)), 5*time.Minute)
-}
-
-func (s *Sender) wait(ctx context.Context, delay time.Duration) bool {
-	if delay > 0 && !waitDuration(ctx, delay) {
-		return false
-	}
-	for ctx.Err() == nil {
-		s.mu.Lock()
-		paused, notBefore := s.paused, s.notBefore
-		s.mu.Unlock()
-		if paused {
-			return false
-		}
-		remaining := time.Until(notBefore)
-		if remaining <= 0 {
-			return true
-		}
-		if !waitDuration(ctx, remaining) {
-			return false
-		}
-	}
-	return false
-}
-
-func waitDuration(ctx context.Context, duration time.Duration) bool {
-	timer := time.NewTimer(duration)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return ctx.Err() == nil
-	}
 }
